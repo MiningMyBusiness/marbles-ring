@@ -1,0 +1,555 @@
+\documentclass[11pt]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{physics}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage[margin=1in]{geometry}
+
+% Custom commands
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\Lp}{\mathcal{L}}
+\newcommand{\PF}{\mathcal{P}}
+\newcommand{\Koop}{\mathcal{K}}
+\newcommand{\FNO}{\text{FNO}}
+\newcommand{\CNN}{\text{CNN}}
+\newcommand{\RNN}{\text{RNN}}
+
+% Theorem environments
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\title{\textbf{Methods Section Draft} \\ 
+\Large Neural Operators for Density Evolution in Impulsive Dynamical Systems: \\
+Learning the Perron-Frobenius Operator Beyond the Lyapunov Horizon}
+
+\author{[Authors]}
+
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides the detailed Methods section for a paper introducing neural operator architectures capable of learning density evolution in dynamical systems with impulsive (non-smooth) dynamics. We focus on one-dimensional hard-sphere gases as a paradigmatic example of chaotic systems where traditional physics-informed neural networks fail due to non-differentiable collision dynamics. Our approach bypasses the Lyapunov time horizon by learning the Perron-Frobenius operator directly from coarse-grained density trajectories.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%==============================================================================
+\section{Problem Formulation}
+%==============================================================================
+
+\subsection{Physical System: 1D Hard-Sphere Gas on a Ring}
+
+We consider a system of $N$ hard spheres constrained to a one-dimensional circular track of length $L$. Each particle $i \in \{1, \ldots, N\}$ is characterized by:
+\begin{itemize}
+    \item Position $x_i \in [0, L)$ with periodic boundary conditions
+    \item Velocity $v_i \in \R$
+    \item Diameter $d_i > 0$
+    \item Mass $m_i > 0$
+\end{itemize}
+
+The system satisfies the \textit{single-file diffusion} (SFD) constraint: particles cannot pass one another, preserving their ordering at all times. This is naturally enforced by the hard-sphere exclusion.
+
+\begin{definition}[System State]
+The microscopic state of the system is the vector $\bm{z} = (\bm{x}, \bm{v}) \in \Gamma$, where $\bm{x} = (x_1, \ldots, x_N)$ and $\bm{v} = (v_1, \ldots, v_N)$. The phase space $\Gamma \subset [0, L)^N \times \R^N$ is constrained by the non-overlap condition:
+\begin{equation}
+    |x_i - x_j|_L > \frac{d_i + d_j}{2}, \quad \forall i \neq j
+\end{equation}
+where $|\cdot|_L$ denotes the distance on the circle of circumference $L$.
+\end{definition}
+
+\subsection{Dynamics: Event-Driven Molecular Dynamics}
+
+Between collisions, particles move freely:
+\begin{equation}
+    \dot{x}_i = v_i, \quad \dot{v}_i = 0
+\end{equation}
+
+Collisions occur instantaneously when two adjacent particles $i$ and $j$ come into contact. The post-collision velocities are determined by conservation of momentum and kinetic energy:
+\begin{align}
+    v_i' &= \frac{(m_i - m_j)v_i + 2m_j v_j}{m_i + m_j} \label{eq:collision1} \\
+    v_j' &= \frac{(m_j - m_i)v_j + 2m_i v_i}{m_i + m_j} \label{eq:collision2}
+\end{align}
+
+\begin{remark}[Integrability vs. Chaos]
+When all masses are equal ($m_i = m$ for all $i$), the collision rule simplifies to velocity exchange ($v_i' = v_j$, $v_j' = v_i$), making the system integrable. With unequal masses and $N \geq 3$, the system becomes chaotic with positive Lyapunov exponents \cite{sinai1970dynamical}.
+\end{remark}
+
+\subsection{The Lyapunov Time Horizon}
+
+The maximum Lyapunov exponent $\lambda_{\max}$ quantifies the exponential divergence of nearby trajectories:
+\begin{equation}
+    \|\delta \bm{z}(t)\| \sim \|\delta \bm{z}(0)\| e^{\lambda_{\max} t}
+\end{equation}
+
+This imposes a fundamental limit on deterministic prediction. The \textit{Lyapunov time} is defined as:
+\begin{equation}
+    T_{\text{Lyap}} = \frac{1}{\lambda_{\max}} \ln\left(\frac{\Delta_{\text{macro}}}{\delta_0}\right)
+\end{equation}
+where $\delta_0$ is the initial uncertainty and $\Delta_{\text{macro}}$ is the macroscopic scale of the system. Beyond $T_{\text{Lyap}}$, pointwise trajectory prediction becomes impossible regardless of computational resources.
+
+\subsection{The Perron-Frobenius Operator}
+
+To bypass the Lyapunov barrier, we shift from tracking individual trajectories to tracking the evolution of probability densities over phase space.
+
+\begin{definition}[Perron-Frobenius Operator]
+Let $\Phi^t: \Gamma \to \Gamma$ denote the flow map of the dynamical system. The Perron-Frobenius (PF) operator $\PF^t: L^1(\Gamma) \to L^1(\Gamma)$ acts on probability densities $\rho: \Gamma \to \R_{\geq 0}$ as:
+\begin{equation}
+    (\PF^t \rho)(\bm{z}) = \int_{\Gamma} \delta\bigl(\bm{z} - \Phi^t(\bm{z}')\bigr) \rho(\bm{z}') \, d\bm{z}'
+\end{equation}
+\end{definition}
+
+\begin{proposition}[Linearity]
+The Perron-Frobenius operator is linear, even when the underlying dynamics $\Phi^t$ are highly nonlinear:
+\begin{equation}
+    \PF^t(\alpha \rho_1 + \beta \rho_2) = \alpha \PF^t \rho_1 + \beta \PF^t \rho_2
+\end{equation}
+\end{proposition}
+
+This linearity is the key insight enabling neural operator learning: we learn a linear map between infinite-dimensional function spaces, which neural operators are designed to approximate.
+
+\subsection{Coarse-Grained Density Fields}
+
+Working in the full $2N$-dimensional phase space is computationally prohibitive. We project to a one-dimensional \textit{spatial density field} by marginalizing over velocities and particle labels:
+\begin{equation}
+    \rho(x, t) = \sum_{i=1}^{N} \E\left[ K_h(x - x_i(t)) \right]
+\end{equation}
+where $K_h$ is a smoothing kernel with bandwidth $h$ (we use a Gaussian kernel with $h = 2 \max_i d_i$). This coarse-graining:
+\begin{enumerate}
+    \item Reduces dimensionality from $2N$ to a fixed spatial resolution
+    \item Smooths the discontinuities inherent in hard-sphere dynamics
+    \item Produces the physically meaningful observable (particle density)
+\end{enumerate}
+
+Our goal is to learn the \textit{projected} PF operator:
+\begin{equation}
+    \mathcal{G}_{\Delta t}: \rho(\cdot, t) \mapsto \rho(\cdot, t + \Delta t)
+\end{equation}
+
+%==============================================================================
+\section{Neural Operator Architecture}
+%==============================================================================
+
+\subsection{Fourier Neural Operator Framework}
+
+We employ the Fourier Neural Operator (FNO) architecture \cite{li2020fourier}, which learns mappings between infinite-dimensional function spaces. The FNO is particularly suited to our problem because:
+\begin{itemize}
+    \item It naturally handles periodic boundary conditions (circular track)
+    \item Spectral methods efficiently capture global correlations
+    \item The architecture is resolution-invariant
+\end{itemize}
+
+\begin{definition}[Fourier Neural Operator]
+The FNO maps an input function $\rho_{\text{in}}: [0, L] \to \R$ to an output function $\rho_{\text{out}}: [0, L] \to \R$ through the composition:
+\begin{equation}
+    \rho_{\text{out}} = Q \circ \sigma(\mathcal{W}_T + \mathcal{F}_T) \circ \cdots \circ \sigma(\mathcal{W}_1 + \mathcal{F}_1) \circ P(\rho_{\text{in}})
+\end{equation}
+where:
+\begin{itemize}
+    \item $P: \R \to \R^{d_h}$ lifts the input to a higher-dimensional channel space
+    \item $\mathcal{F}_\ell$ are spectral convolution layers
+    \item $\mathcal{W}_\ell$ are local linear transforms (pointwise)
+    \item $\sigma$ is a nonlinear activation (GeLU)
+    \item $Q: \R^{d_h} \to \R$ projects back to the output space
+\end{itemize}
+\end{definition}
+
+\subsection{Spectral Convolution Layer}
+
+The spectral convolution $\mathcal{F}$ operates in Fourier space, enabling efficient global computation:
+
+\begin{equation}
+    (\mathcal{F} u)(x) = \mathcal{F}^{-1}\left( R \cdot \mathcal{F}(u) \right)(x)
+\end{equation}
+
+where $\mathcal{F}$ and $\mathcal{F}^{-1}$ denote the Fourier transform and its inverse, and $R \in \mathbb{C}^{d_h \times d_h \times k_{\max}}$ are learnable complex weights for each of the retained $k_{\max}$ Fourier modes.
+
+In discrete form, for input $u \in \R^{d_h \times n}$ (channels $\times$ spatial points):
+\begin{align}
+    \hat{u} &= \text{FFT}(u) \in \mathbb{C}^{d_h \times (n/2 + 1)} \\
+    \hat{v}_k &= \sum_{j=1}^{d_h} R_{jk} \hat{u}_{jk}, \quad k = 1, \ldots, k_{\max} \\
+    v &= \text{IFFT}(\hat{v}) \in \R^{d_h \times n}
+\end{align}
+
+Higher Fourier modes ($k > k_{\max}$) are truncated, acting as an implicit low-pass filter. This is appropriate for coarse-grained density fields where high-frequency microscopic details are already smoothed.
+
+\subsection{Full Layer Structure}
+
+Each Fourier layer combines spectral and local pathways:
+\begin{equation}
+    u^{(\ell+1)} = \sigma\left( \mathcal{F}_\ell(u^{(\ell)}) + W_\ell u^{(\ell)} + b_\ell \right)
+\end{equation}
+
+where $W_\ell \in \R^{d_h \times d_h}$ is a pointwise linear transform and $b_\ell \in \R^{d_h}$ is a bias. The local pathway captures features that are not well-represented in the truncated Fourier basis.
+
+\subsection{Architecture Hyperparameters}
+
+Based on preliminary experiments, we use:
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Symbol} & \textbf{Value} \\
+\midrule
+Spatial resolution & $n$ & 128 \\
+Fourier modes retained & $k_{\max}$ & 32 \\
+Hidden channels & $d_h$ & 64 \\
+Number of Fourier layers & $T$ & 4 \\
+Activation function & $\sigma$ & GeLU \\
+\bottomrule
+\end{tabular}
+\caption{FNO architecture hyperparameters.}
+\label{tab:hyperparams}
+\end{table}
+
+\subsection{Multi-Step Prediction}
+
+For long-horizon prediction, we apply the learned operator autoregressively:
+\begin{equation}
+    \hat{\rho}_{t + k\Delta t} = \underbrace{\mathcal{G}_{\Delta t} \circ \cdots \circ \mathcal{G}_{\Delta t}}_{k \text{ times}}(\rho_t)
+\end{equation}
+
+Autoregressive rollout enables prediction far beyond $T_{\text{Lyap}}$, limited only by the accumulation of approximation errors.
+
+%==============================================================================
+\section{Training Methodology}
+%==============================================================================
+
+\subsection{Data Generation}
+
+Training data is generated via event-driven molecular dynamics simulation.
+
+\begin{algorithm}[H]
+\caption{Event-Driven Hard-Sphere Simulation}
+\label{alg:simulation}
+\begin{algorithmic}[1]
+\Require Initial state $\bm{z}_0 = (\bm{x}_0, \bm{v}_0)$, duration $T$, save interval $\Delta t_{\text{save}}$
+\State $t \gets 0$
+\State $\texttt{states} \gets [\bm{z}_0]$
+\While{$t < T$}
+    \State $t_{\text{coll}}, (i, j) \gets \textsc{FindNextCollision}(\bm{z})$
+    \If{$t_{\text{coll}} > T$}
+        \State \textsc{AdvanceParticles}$(T - t)$
+        \State \textbf{break}
+    \EndIf
+    \While{next save time $< t + t_{\text{coll}}$}
+        \State \textsc{AdvanceParticles}(next save time $- t$)
+        \State $\texttt{states}.\text{append}(\bm{z})$
+    \EndWhile
+    \State \textsc{AdvanceParticles}$(t_{\text{coll}})$
+    \State $(v_i, v_j) \gets \textsc{ResolveCollision}(i, j)$ \Comment{Eqs. \eqref{eq:collision1}--\eqref{eq:collision2}}
+\EndWhile
+\State \Return \texttt{states}
+\end{algorithmic}
+\end{algorithm}
+
+For each trajectory, we record:
+\begin{itemize}
+    \item Snapshots of the density field $\rho(x, t_k)$ at intervals $\Delta t_{\text{save}}$
+    \item Collision events $(t, i, j, \Delta p)$ for auxiliary analysis
+    \item System parameters $(N, \{m_i\}, \{d_i\}, L)$ as metadata
+\end{itemize}
+
+\subsection{Dataset Construction}
+
+We generate a diverse dataset spanning the parameter space:
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Parameter} & \textbf{Range} & \textbf{Sampling} \\
+\midrule
+Number of particles $N$ & $[3, 15]$ & Uniform integer \\
+Track length $L$ & $1000$ (fixed) & --- \\
+Diameter $d_i$ & $[5, 25]$ & Uniform \\
+Mass $m_i$ & $\propto d_i^3$ & Equal density \\
+Initial speed $|v_i|$ & $[20, 80]$ & Uniform \\
+Initial direction & $\pm 1$ & Uniform \\
+Simulation time & $500$ & Fixed \\
+Save interval $\Delta t$ & $0.1$ & Fixed \\
+\bottomrule
+\end{tabular}
+\caption{Dataset generation parameters.}
+\label{tab:dataset}
+\end{table}
+
+Each trajectory yields approximately $5000$ input-output pairs $(\rho_t, \rho_{t+\Delta t})$.
+
+\textbf{Dataset size:} We generate $M = 1000$ trajectories, yielding $\sim 5 \times 10^6$ training samples after windowing.
+
+\subsection{Loss Function}
+
+We minimize the mean squared error between predicted and true density fields:
+\begin{equation}
+    \mathcal{L}(\theta) = \frac{1}{M} \sum_{m=1}^{M} \frac{1}{T_m} \sum_{t=1}^{T_m} \left\| \mathcal{G}_{\Delta t}^{(\theta)}(\rho_t^{(m)}) - \rho_{t+\Delta t}^{(m)} \right\|_2^2
+\end{equation}
+
+where $\theta$ denotes the network parameters.
+
+\paragraph{Auxiliary Losses (Optional):}
+To encourage physical consistency, we optionally add:
+\begin{itemize}
+    \item \textbf{Mass conservation:} $\mathcal{L}_{\text{mass}} = \left( \int_0^L \hat{\rho}(x) dx - \int_0^L \rho(x) dx \right)^2$
+    \item \textbf{Positivity:} $\mathcal{L}_{\text{pos}} = \| \min(\hat{\rho}, 0) \|_2^2$
+\end{itemize}
+
+\subsection{Optimization}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Setting} & \textbf{Value} \\
+\midrule
+Optimizer & AdamW \\
+Learning rate & $10^{-3}$ (initial) \\
+Learning rate schedule & Cosine annealing \\
+Weight decay & $10^{-4}$ \\
+Batch size & 64 \\
+Epochs & 200 \\
+Gradient clipping & $\|\nabla\|_2 \leq 1.0$ \\
+\bottomrule
+\end{tabular}
+\caption{Training configuration.}
+\label{tab:training}
+\end{table}
+
+Training is performed on a single NVIDIA A100 GPU, requiring approximately 8 hours for the full dataset.
+
+%==============================================================================
+\section{Evaluation Metrics}
+%==============================================================================
+
+\subsection{Single-Step Accuracy}
+
+For immediate prediction quality, we report:
+\begin{equation}
+    \text{MSE}_1 = \E\left[ \| \mathcal{G}_{\Delta t}(\rho_t) - \rho_{t+\Delta t} \|_2^2 \right]
+\end{equation}
+
+and the relative $L^2$ error:
+\begin{equation}
+    \epsilon_{\text{rel}} = \E\left[ \frac{\| \mathcal{G}_{\Delta t}(\rho_t) - \rho_{t+\Delta t} \|_2}{\| \rho_{t+\Delta t} \|_2} \right]
+\end{equation}
+
+\subsection{Lyapunov Horizon Analysis}
+
+The key contribution of this work is predicting \textit{beyond} the Lyapunov time. We evaluate:
+
+\begin{definition}[Prediction Horizon]
+The prediction horizon $T_{\text{pred}}(\epsilon)$ is the time at which the relative error first exceeds threshold $\epsilon$:
+\begin{equation}
+    T_{\text{pred}}(\epsilon) = \inf \left\{ t : \frac{\| \hat{\rho}_t - \rho_t \|_2}{\| \rho_t \|_2} > \epsilon \right\}
+\end{equation}
+\end{definition}
+
+We report $T_{\text{pred}}$ normalized by the Lyapunov time:
+\begin{equation}
+    \tau_{\text{pred}} = \frac{T_{\text{pred}}}{T_{\text{Lyap}}}
+\end{equation}
+
+A value $\tau_{\text{pred}} > 1$ indicates successful prediction beyond the deterministic horizon.
+
+\subsection{Statistical Consistency}
+
+Even when pointwise density prediction degrades, the predicted density should maintain correct statistical properties. We evaluate:
+
+\paragraph{Invariant Measure:} For long-time predictions, the time-averaged density should converge to the microcanonical equilibrium:
+\begin{equation}
+    \bar{\rho}_{\text{pred}} = \frac{1}{T} \int_0^T \hat{\rho}(\cdot, t) \, dt \approx \rho_{\text{eq}}
+\end{equation}
+
+\paragraph{Autocorrelation Structure:} We compare the temporal autocorrelation function:
+\begin{equation}
+    C(\tau) = \langle \rho(x, t) \rho(x, t+\tau) \rangle - \langle \rho \rangle^2
+\end{equation}
+between predicted and true trajectories.
+
+\subsection{Generalization Tests}
+
+We test generalization across:
+\begin{enumerate}
+    \item \textbf{Out-of-distribution $N$:} Train on $N \in [3, 10]$, test on $N \in [11, 15]$
+    \item \textbf{Different mass distributions:} Train on $m \propto d^3$, test on uniform masses
+    \item \textbf{Higher resolution:} Train at $n = 128$, test at $n = 256$
+\end{enumerate}
+
+%==============================================================================
+\section{Baseline Methods}
+%==============================================================================
+
+We compare against:
+
+\subsection{Extended Dynamic Mode Decomposition (EDMD)}
+
+EDMD approximates the Koopman operator using a dictionary of observables \cite{williams2015data}. We use:
+\begin{itemize}
+    \item Fourier basis functions up to mode $k = 32$
+    \item Regularized least-squares fitting
+\end{itemize}
+
+\subsection{Ulam's Method}
+
+Ulam's method discretizes the PF operator by partitioning phase space into cells and computing transition probabilities \cite{ulam1960collection}. We use $100$ spatial bins.
+
+\subsection{Recurrent Neural Networks}
+
+We implement an LSTM baseline:
+\begin{itemize}
+    \item Input: Flattened density field
+    \item Hidden dimension: 256
+    \item Layers: 2
+    \item Output: Next density field
+\end{itemize}
+
+\subsection{Convolutional Neural Networks}
+
+A U-Net style architecture:
+\begin{itemize}
+    \item Encoder: 4 convolutional blocks with downsampling
+    \item Decoder: 4 transposed convolutional blocks
+    \item Skip connections between encoder and decoder
+\end{itemize}
+
+%==============================================================================
+\section{Implementation Details}
+%==============================================================================
+
+\subsection{Software}
+
+The codebase is implemented in:
+\begin{itemize}
+    \item \textbf{Physics simulation:} Python with NumPy (event-driven MD)
+    \item \textbf{Neural operators:} PyTorch 2.0 with custom FNO layers
+    \item \textbf{Training infrastructure:} PyTorch Lightning
+    \item \textbf{Experiment tracking:} Weights \& Biases
+\end{itemize}
+
+Code and trained models will be released at: \texttt{github.com/[redacted]/impulsive-neural-operators}
+
+\subsection{Computational Resources}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Component} & \textbf{Resource} \\
+\midrule
+Data generation & 32-core CPU cluster, 24 hours \\
+FNO training & 1$\times$ NVIDIA A100 (40GB), 8 hours \\
+Baseline training & 1$\times$ NVIDIA V100 (32GB), 4--12 hours each \\
+Evaluation & 1$\times$ NVIDIA A100, 2 hours \\
+\bottomrule
+\end{tabular}
+\caption{Computational resources used.}
+\end{table}
+
+\subsection{Reproducibility}
+
+All random seeds are fixed:
+\begin{itemize}
+    \item Data generation: seed $= 42$
+    \item Train/validation/test split: $80/10/10$
+    \item Model initialization: seed $= 0$
+\end{itemize}
+
+Confidence intervals are computed over 5 independent training runs.
+
+%==============================================================================
+\section{Extension: Inverse Problem}
+%==============================================================================
+
+As a secondary contribution, we address the \textit{inverse problem}: inferring particle masses and diameters from collision statistics.
+
+\subsection{Problem Setup}
+
+Given a sequence of collision events:
+\begin{equation}
+    \mathcal{C} = \{(t_k, i_k, j_k, \Delta p_k)\}_{k=1}^{K}
+\end{equation}
+where $t_k$ is the collision time, $(i_k, j_k)$ are the colliding particles, and $\Delta p_k$ is the momentum transfer magnitude, we seek to recover $\{m_i, d_i\}_{i=1}^{N}$.
+
+\subsection{Collision Graph Neural Network}
+
+We propose a graph neural network operating on the collision graph:
+\begin{itemize}
+    \item \textbf{Nodes:} Particles, with learnable embeddings
+    \item \textbf{Edges:} Collision events between particle pairs
+    \item \textbf{Edge features:} $(t_k, \Delta p_k, x_k)$
+    \item \textbf{Message passing:} Aggregate collision information to each particle
+    \item \textbf{Output heads:} Predict $(m_i, d_i)$ for each particle
+\end{itemize}
+
+This architecture handles the non-differentiability challenge by operating on the discrete collision graph rather than continuous trajectories.
+
+%==============================================================================
+\section{Limitations and Future Work}
+%==============================================================================
+
+\subsection{Current Limitations}
+
+\begin{enumerate}
+    \item \textbf{Coarse-graining dependence:} The choice of kernel bandwidth $h$ affects what dynamics are captured. Very small $h$ reintroduces discontinuities; very large $h$ over-smooths.
+    
+    \item \textbf{Fixed $\Delta t$:} The current model is trained for a specific time step. Adaptive time-stepping would require architecture modifications.
+    
+    \item \textbf{Homogeneous track:} We assume a uniform circular track. Extensions to heterogeneous media (e.g., varying diffusivity) are left for future work.
+\end{enumerate}
+
+\subsection{Future Directions}
+
+\begin{enumerate}
+    \item \textbf{Biological applications:} Apply to polyribosome dynamics on circular mRNA, where ribosomes act as hard spheres with time-varying masses (due to nascent polypeptide chains).
+    
+    \item \textbf{Higher dimensions:} Extend to 2D and 3D hard-sphere gases, relevant to granular flows and colloidal suspensions.
+    
+    \item \textbf{Stochastic extensions:} Incorporate thermal noise to bridge deterministic chaos and Brownian dynamics.
+\end{enumerate}
+
+%==============================================================================
+% References (placeholder)
+%==============================================================================
+
+\begin{thebibliography}{99}
+
+\bibitem{li2020fourier}
+Z. Li, N. Kovachki, K. Azizzadenesheli, B. Liu, K. Bhattacharya, A. Stuart, and A. Anandkumar.
+\newblock Fourier Neural Operator for Parametric Partial Differential Equations.
+\newblock In \textit{International Conference on Learning Representations}, 2021.
+
+\bibitem{sinai1970dynamical}
+Y. G. Sinai.
+\newblock Dynamical systems with elastic reflections.
+\newblock \textit{Russian Mathematical Surveys}, 25(2):137--189, 1970.
+
+\bibitem{williams2015data}
+M. O. Williams, I. G. Kevrekidis, and C. W. Rowley.
+\newblock A data-driven approximation of the Koopman operator: Extending dynamic mode decomposition.
+\newblock \textit{Journal of Nonlinear Science}, 25(6):1307--1346, 2015.
+
+\bibitem{ulam1960collection}
+S. M. Ulam.
+\newblock \textit{A Collection of Mathematical Problems}.
+\newblock Interscience Publishers, 1960.
+
+\end{thebibliography}
+
+\end{document}

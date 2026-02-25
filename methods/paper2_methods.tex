@@ -1,0 +1,475 @@
+% ============================================================================
+% METHODS SECTION
+% Paper 2: Chaotic Hamiltonian Dynamics of Polyribosome Traffic on Circular mRNA
+% 
+% Target journals: Biophysical Journal, PLOS Computational Biology, Physical Biology
+% ============================================================================
+
+\documentclass[11pt]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+% Title
+\title{\textbf{Methods Section Draft} \\ 
+\large Chaotic Hamiltonian Dynamics of Polyribosome Traffic on Circular mRNA: Beyond TASEP}
+\author{[Authors]}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================================
+\section{Methods}
+% ============================================================================
+
+\subsection{Model Formulation}
+
+\subsubsection{System Definition and Physical Framework}
+
+We model a polyribosome complex as $N$ hard spheres constrained to a one-dimensional circular track of length $L$, representing a circularized mRNA strand. The circular topology reflects the well-characterized closed-loop conformation adopted by eukaryotic mRNAs through eIF4E-eIF4G-PABP bridging interactions \cite{wells1998circularization, kahvejian2005mammalian}. This geometry enables Closed-Loop-Assisted Reinitiation (CLAR), wherein terminating ribosomes are efficiently recycled to the start codon without diffusing into the bulk cytoplasm \cite{vicens2018revisiting}.
+
+Each ribosome $i$ is characterized by a time-dependent state vector:
+\begin{equation}
+    \mathbf{s}_i(t) = \left( x_i(t), \, v_i(t), \, d_i(t), \, m_i(t) \right)
+\end{equation}
+where $x_i \in [0, L)$ is the position along the mRNA (in codon units), $v_i$ is the translocation velocity, $d_i$ is the effective collision diameter, and $m_i$ is the effective mass. Crucially, both $d_i(t)$ and $m_i(t)$ evolve as the nascent polypeptide chain grows during translation, distinguishing our model from classical hard-sphere systems with fixed particle properties.
+
+The system obeys strict single-file diffusion (SFD) constraints: ribosomes cannot pass one another due to their physical size relative to the mRNA track width. This ordering constraint is naturally satisfied by the hard-sphere collision dynamics.
+
+\subsubsection{Hamiltonian Dynamics}
+
+The system evolves according to deterministic Hamiltonian mechanics between collisions. The Hamiltonian is:
+\begin{equation}
+    \mathcal{H} = \sum_{i=1}^{N} \frac{p_i^2}{2m_i(t)} + \sum_{i<j} V_{\text{HS}}(r_{ij})
+\end{equation}
+where $p_i = m_i v_i$ is the momentum of ribosome $i$, and $V_{\text{HS}}$ is the hard-sphere potential:
+\begin{equation}
+    V_{\text{HS}}(r_{ij}) = 
+    \begin{cases}
+        \infty & \text{if } r_{ij} < \frac{1}{2}(d_i + d_j) \\
+        0 & \text{otherwise}
+    \end{cases}
+\end{equation}
+Here, $r_{ij} = \min(|x_i - x_j|, L - |x_i - x_j|)$ is the geodesic distance on the circular track.
+
+Between collisions, ribosomes undergo free translocation:
+\begin{equation}
+    \frac{dx_i}{dt} = v_i, \quad \frac{dp_i}{dt} = 0
+\end{equation}
+
+At the moment of collision between ribosomes $i$ and $j$, velocities are updated according to the one-dimensional elastic collision formulas:
+\begin{align}
+    v_i' &= \frac{(m_i - m_j)v_i + 2m_j v_j}{m_i + m_j} \\
+    v_j' &= \frac{(m_j - m_i)v_j + 2m_i v_i}{m_i + m_j}
+\end{align}
+These equations conserve both total momentum $P = \sum_i m_i v_i$ and total kinetic energy $E = \sum_i \frac{1}{2}m_i v_i^2$.
+
+\subsubsection{Nascent Chain Dynamics and Mass/Diameter Evolution}
+
+The key biological innovation of our model is the explicit coupling between translational progress and ribosome physical properties. As ribosome $i$ translates, its nascent polypeptide chain grows at a rate proportional to the translocation velocity:
+\begin{equation}
+    \frac{d\ell_i}{dt} = v_i
+\end{equation}
+where $\ell_i(t)$ is the chain length in amino acid residues (equivalent to codons translated).
+
+The nascent chain contributes to the effective mass:
+\begin{equation}
+    m_i(t) = m_{\text{ribo}} + \ell_i(t) \cdot m_{\text{aa}}
+\end{equation}
+where $m_{\text{ribo}} = 4.2$ MDa is the 80S ribosome mass and $m_{\text{aa}} \approx 110$ Da is the average amino acid mass.
+
+The effective diameter depends on both the ribosome footprint and the hydrodynamic radius of the emerged nascent chain. We model the chain as a polymer that may adopt different conformational states:
+\begin{equation}
+    d_i(t) = d_{\text{ribo}} + 2R_g(\ell_i^{\text{emerged}})
+\end{equation}
+where $d_{\text{ribo}} \approx 10$ codons is the ribosome footprint, and $R_g$ is the radius of gyration of the emerged portion of the nascent chain.
+
+The emerged chain length accounts for the ribosomal exit tunnel:
+\begin{equation}
+    \ell_i^{\text{emerged}} = \max\left(0, \, \ell_i - \ell_{\text{tunnel}}\right)
+\end{equation}
+where $\ell_{\text{tunnel}} \approx 40$ residues is the exit tunnel capacity \cite{wilson2011ribosome}.
+
+The radius of gyration follows polymer scaling laws dependent on the folding state:
+\begin{equation}
+    R_g(N) = b \cdot N^{\nu}
+\end{equation}
+where $b \approx 1$ nm is the Kuhn length and the scaling exponent $\nu$ varies:
+\begin{equation}
+    \nu = 
+    \begin{cases}
+        0.6 & \text{extended/random coil} \\
+        0.5 & \text{partially folded} \\
+        0.33 & \text{compact/globular}
+    \end{cases}
+\end{equation}
+
+We assign folding states based on emerged chain length, reflecting the progressive co-translational folding observed experimentally \cite{kaiser2011emergence, holtkamp2015cotranslational}:
+\begin{equation}
+    \text{Folding state} = 
+    \begin{cases}
+        \text{extended} & \ell^{\text{emerged}} < 50 \\
+        \text{partial} & 50 \leq \ell^{\text{emerged}} < 150 \\
+        \text{compact} & \ell^{\text{emerged}} \geq 150
+    \end{cases}
+\end{equation}
+
+\subsubsection{Circular mRNA Topology and Boundary Conditions}
+
+The mRNA is modeled as a circular track with distinct functional regions:
+\begin{equation}
+    L = L_{5'\text{UTR}} + L_{\text{CDS}} + L_{3'\text{UTR}}
+\end{equation}
+
+Positions are defined modulo $L$, implementing periodic boundary conditions:
+\begin{equation}
+    x_i \mapsto x_i \mod L
+\end{equation}
+
+Translation initiation occurs stochastically at the start codon position $x_{\text{start}} = L_{5'\text{UTR}}$ with rate $k_{\text{init}}$:
+\begin{equation}
+    P(\text{initiation in } dt) = k_{\text{init}} \cdot dt \cdot \mathbf{1}_{\text{site clear}}
+\end{equation}
+where $\mathbf{1}_{\text{site clear}}$ is an indicator function that equals 1 only if no ribosome occupies the initiation site.
+
+Upon reaching the stop codon at $x_{\text{stop}} = L_{5'\text{UTR}} + L_{\text{CDS}}$, a ribosome terminates and, under CLAR, is recycled to the start codon:
+\begin{equation}
+    x_i \to x_{\text{start}}, \quad \ell_i \to 0, \quad v_i \to v_0
+\end{equation}
+where $v_0$ is the baseline elongation rate.
+
+% ============================================================================
+\subsection{Emergence of Chaos}
+% ============================================================================
+
+\subsubsection{Lyapunov Exponent and Predictability Horizon}
+
+For $N \geq 3$ particles with unequal masses, the system exhibits deterministic chaos characterized by a positive maximal Lyapunov exponent $\lambda_{\max} > 0$. This exponent quantifies the exponential divergence of initially nearby trajectories:
+\begin{equation}
+    \|\delta \mathbf{x}(t)\| \sim \|\delta \mathbf{x}(0)\| \cdot e^{\lambda_{\max} t}
+\end{equation}
+
+The Lyapunov time, $\tau_{\text{Lyap}} = 1/\lambda_{\max}$, defines the predictability horizon beyond which trajectory-level predictions become unreliable. We estimate $\lambda_{\max}$ numerically by evolving pairs of trajectories with infinitesimal initial separation.
+
+\subsubsection{Conditions for Chaos}
+
+The transition from integrable to chaotic dynamics depends critically on mass heterogeneity. For identical masses ($m_i = m$ for all $i$), the system is completely integrable: collisions simply exchange velocities, and the dynamics are equivalent to non-interacting particles passing through each other. This corresponds to $\lambda_{\max} = 0$.
+
+Mass heterogeneity breaks integrability. We quantify heterogeneity via the coefficient of variation:
+\begin{equation}
+    \text{CV}_m = \frac{\sigma_m}{\bar{m}} = \frac{\sqrt{\frac{1}{N}\sum_i (m_i - \bar{m})^2}}{\frac{1}{N}\sum_i m_i}
+\end{equation}
+
+In polyribosome systems, mass heterogeneity arises naturally from the different nascent chain lengths, with $\text{CV}_m$ evolving dynamically as translation proceeds.
+
+% ============================================================================
+\subsection{Density Field Evolution and the Perron-Frobenius Operator}
+% ============================================================================
+
+\subsubsection{Coarse-Grained Density}
+
+While individual trajectories become unpredictable beyond $\tau_{\text{Lyap}}$, the evolution of probability densities remains well-defined. We define the coarse-grained ribosome density field:
+\begin{equation}
+    \rho(x, t) = \sum_{i=1}^{N} K_\sigma(x - x_i(t))
+\end{equation}
+where $K_\sigma$ is a Gaussian kernel with width $\sigma$:
+\begin{equation}
+    K_\sigma(x) = \frac{1}{\sigma\sqrt{2\pi}} \exp\left(-\frac{x^2}{2\sigma^2}\right)
+\end{equation}
+
+This density field is directly comparable to ribosome profiling (Ribo-seq) data, which measures ribosome occupancy along mRNA with codon-level resolution \cite{ingolia2009genome}.
+
+\subsubsection{Perron-Frobenius Operator}
+
+The time evolution of the density field is governed by the Perron-Frobenius (PF) operator $\mathcal{P}^t$:
+\begin{equation}
+    \rho(x, t+\Delta t) = \mathcal{P}^{\Delta t} \rho(x, t)
+\end{equation}
+
+For a deterministic dynamical system with flow map $\Phi^t$, the PF operator acts on densities via:
+\begin{equation}
+    (\mathcal{P}^t \rho)(x) = \int \delta\left(x - \Phi^t(y)\right) \rho(y) \, dy
+\end{equation}
+
+Crucially, the PF operator is \textit{linear} even when the underlying dynamics are nonlinear and chaotic. This linearity enables systematic analysis and, as we exploit, machine learning approximation.
+
+\subsubsection{Neural Operator Approximation}
+
+We approximate the PF operator using a Fourier Neural Operator (FNO) architecture \cite{li2020fourier}. The FNO learns the mapping:
+\begin{equation}
+    \rho(x, t) \mapsto \rho(x, t + \Delta t)
+\end{equation}
+directly from simulation data, without requiring explicit knowledge of the underlying equations.
+
+The FNO architecture consists of:
+\begin{enumerate}
+    \item A lifting layer: $\mathbb{R} \to \mathbb{R}^{d_h}$ (density to hidden channels)
+    \item $L$ Fourier layers with spectral convolutions
+    \item A projection layer: $\mathbb{R}^{d_h} \to \mathbb{R}$ (hidden channels to density)
+\end{enumerate}
+
+Each Fourier layer performs:
+\begin{equation}
+    v^{(l+1)}(x) = \sigma\left( W^{(l)} v^{(l)}(x) + \mathcal{F}^{-1}\left(R^{(l)} \cdot \mathcal{F}(v^{(l)})\right)(x) \right)
+\end{equation}
+where $\mathcal{F}$ denotes the Fourier transform, $R^{(l)}$ are learnable spectral weights, and $\sigma$ is a nonlinear activation (GeLU).
+
+The periodic boundary conditions of the circular track make the Fourier basis natural, as it automatically respects the topology.
+
+% ============================================================================
+\subsection{Comparison with TASEP}
+% ============================================================================
+
+\subsubsection{Totally Asymmetric Simple Exclusion Process}
+
+The standard model for ribosome traffic is the Totally Asymmetric Simple Exclusion Process (TASEP) \cite{macdonald1968kinetics, shaw2003totally}. TASEP is a discrete-time, discrete-space stochastic model where:
+\begin{itemize}[nosep]
+    \item The mRNA is discretized into $L$ sites
+    \item Each site is either empty or occupied by one ribosome
+    \item At each timestep, a ribosome hops forward with probability $p$ if the next site is empty
+    \item Ribosomes enter at the first site with rate $\alpha$ and exit from the last with rate $\beta$
+\end{itemize}
+
+For a periodic (circular) track with homogeneous hopping rate $p$, the steady-state density is uniform:
+\begin{equation}
+    \rho_{\text{TASEP}}^{\text{steady}} = \frac{N}{L}
+\end{equation}
+
+\subsubsection{Key Differences from Our Model}
+
+Our Hamiltonian model differs from TASEP in several fundamental ways:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Property} & \textbf{TASEP} & \textbf{Hamiltonian Model} \\
+\midrule
+Dynamics & Stochastic, Markovian & Deterministic, chaotic \\
+Time & Discrete & Continuous \\
+Space & Discrete lattice & Continuous \\
+Particle properties & Identical & Heterogeneous, time-varying \\
+Collisions & Exclusion (blocking) & Elastic momentum transfer \\
+Memory & Memoryless & Full phase-space memory \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of TASEP and Hamiltonian polyribosome models.}
+\label{tab:tasep_comparison}
+\end{table}
+
+These differences lead to distinct predictions for:
+\begin{enumerate}[nosep]
+    \item \textbf{Fluctuation statistics}: TASEP predicts Poissonian fluctuations; our model predicts correlated fluctuations arising from deterministic chaos
+    \item \textbf{Density correlations}: TASEP has short-range correlations; chaotic dynamics can produce long-range correlations
+    \item \textbf{Traffic jam dynamics}: TASEP jams dissolve stochastically; Hamiltonian jams exhibit inertial effects
+\end{enumerate}
+
+% ============================================================================
+\subsection{Simulation Algorithm}
+% ============================================================================
+
+\subsubsection{Event-Driven Molecular Dynamics}
+
+We employ an event-driven simulation algorithm that computes exact collision times rather than using fixed timestep integration. This approach:
+\begin{itemize}[nosep]
+    \item Eliminates discretization error in collision detection
+    \item Provides exact collision timestamps for machine learning
+    \item Is efficient when collision frequency is moderate
+\end{itemize}
+
+The algorithm proceeds as follows:
+\begin{enumerate}[nosep]
+    \item \textbf{Initialize}: Place $N$ ribosomes with initial positions, velocities, and nascent chain lengths
+    \item \textbf{Compute collision times}: For each adjacent pair $(i, i+1)$ on the circular track, compute:
+    \begin{equation}
+        t_{ij}^{\text{collision}} = \frac{r_{ij} - \frac{1}{2}(d_i + d_j)}{v_i - v_j}
+    \end{equation}
+    retaining only positive, finite values
+    \item \textbf{Find next event}: $t^* = \min_{\{i,j\}} t_{ij}^{\text{collision}}$
+    \item \textbf{Advance system}: Update all positions: $x_i \to x_i + v_i \cdot t^*$
+    \item \textbf{Update nascent chains}: $\ell_i \to \ell_i + v_i \cdot t^*$, then recompute $m_i$ and $d_i$
+    \item \textbf{Resolve collision}: Apply elastic collision formulas to colliding pair
+    \item \textbf{Handle termination}: If any ribosome crosses the stop codon, apply CLAR recycling
+    \item \textbf{Handle initiation}: With probability $k_{\text{init}} \cdot t^*$, attempt to add a new ribosome
+    \item \textbf{Repeat} from step 2 until target simulation time
+\end{enumerate}
+
+\subsubsection{Conservation Verification}
+
+At each timestep, we verify conservation laws:
+\begin{align}
+    \left| E(t) - E(0) \right| &< \epsilon_E \\
+    \left| P(t) - P(0) \right| &< \epsilon_P
+\end{align}
+where $\epsilon_E, \epsilon_P \sim 10^{-10}$ are numerical tolerance thresholds. Violations indicate algorithmic errors.
+
+% ============================================================================
+\subsection{Biological Parameters}
+% ============================================================================
+
+We parameterize the model using experimentally measured values from the literature (Table \ref{tab:parameters}).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Value} & \textbf{Reference} \\
+\midrule
+Ribosome mass & $m_{\text{ribo}}$ & 4.2 MDa & \cite{ben2011quantifying} \\
+Ribosome footprint & $d_{\text{ribo}}$ & 28--30 nt ($\approx$10 codons) & \cite{wolin1988ribosome} \\
+Exit tunnel length & $\ell_{\text{tunnel}}$ & 40 residues & \cite{wilson2011ribosome} \\
+Amino acid mass & $m_{\text{aa}}$ & 110 Da (average) & -- \\
+Elongation rate & $v_0$ & 5--10 codons/s & \cite{ingolia2011ribosome} \\
+Initiation rate & $k_{\text{init}}$ & 0.03--0.3 s$^{-1}$ & \cite{shah2013rate} \\
+Typical CDS length & $L_{\text{CDS}}$ & 300--500 codons & -- \\
+\bottomrule
+\end{tabular}
+\caption{Biological parameters used in simulations.}
+\label{tab:parameters}
+\end{table}
+
+% ============================================================================
+\subsection{Data Analysis and Validation}
+% ============================================================================
+
+\subsubsection{Comparison with Ribosome Profiling Data}
+
+Ribosome profiling (Ribo-seq) provides genome-wide measurements of ribosome positions along mRNAs \cite{ingolia2009genome}. The technique generates sequencing reads proportional to ribosome density, enabling direct comparison with our simulated density fields.
+
+For validation, we:
+\begin{enumerate}[nosep]
+    \item Obtain published Ribo-seq datasets for well-characterized mRNAs
+    \item Compute the time-averaged density profile from simulations:
+    \begin{equation}
+        \bar{\rho}(x) = \frac{1}{T} \int_0^T \rho(x, t) \, dt
+    \end{equation}
+    \item Compare with normalized Ribo-seq read counts using Pearson correlation and root-mean-square error
+\end{enumerate}
+
+\subsubsection{Statistical Measures}
+
+We characterize the system using:
+\begin{itemize}[nosep]
+    \item \textbf{Ribosome density}: $\langle N \rangle / L_{\text{CDS}}$
+    \item \textbf{Translation rate}: Number of completed translations per unit time
+    \item \textbf{Mass heterogeneity}: $\text{CV}_m(t)$ as a function of time
+    \item \textbf{Collision frequency}: Collisions per ribosome per unit time
+    \item \textbf{Traffic jam duration}: Time intervals where local density exceeds a threshold
+\end{itemize}
+
+\subsubsection{Lyapunov Exponent Estimation}
+
+We estimate $\lambda_{\max}$ using the standard algorithm:
+\begin{enumerate}[nosep]
+    \item Initialize two trajectories with separation $\|\delta \mathbf{x}(0)\| = \epsilon_0$
+    \item Evolve both for time $\tau$
+    \item Record $\|\delta \mathbf{x}(\tau)\|$
+    \item Rescale the perturbed trajectory to restore separation $\epsilon_0$
+    \item Repeat and average:
+    \begin{equation}
+        \lambda_{\max} \approx \frac{1}{n\tau} \sum_{k=1}^{n} \ln \frac{\|\delta \mathbf{x}(k\tau)\|}{\epsilon_0}
+    \end{equation}
+\end{enumerate}
+
+% ============================================================================
+\subsection{Software Implementation}
+% ============================================================================
+
+The simulation code is implemented in Python with the following components:
+\begin{itemize}[nosep]
+    \item \texttt{core.ParticleSystem}: Base hard-sphere dynamics engine
+    \item \texttt{biology.Ribosome}: Ribosome with nascent chain growth
+    \item \texttt{biology.PolyribosomeSystem}: Full polyribosome simulation
+    \item \texttt{neural\_operators.FourierNeuralOperator}: FNO for density prediction
+\end{itemize}
+
+Neural operator training uses PyTorch with the Adam optimizer. Simulations were performed on [hardware details]. Code is available at [repository URL].
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+
+\begin{thebibliography}{99}
+
+\bibitem{wells1998circularization}
+Wells, S.E., Hillner, P.E., Vale, R.D., \& Sachs, A.B. (1998).
+Circularization of mRNA by eukaryotic translation initiation factors.
+\textit{Molecular Cell}, 2(1), 135--140.
+
+\bibitem{kahvejian2005mammalian}
+Kahvejian, A., Svitkin, Y.V., Sukarieh, R., M'Boutchou, M.N., \& Sonenberg, N. (2005).
+Mammalian poly(A)-binding protein is a eukaryotic translation initiation factor.
+\textit{Genes \& Development}, 19(1), 104--113.
+
+\bibitem{vicens2018revisiting}
+Vicens, Q., Kieft, J.S., \& Rissland, O.S. (2018).
+Revisiting the closed-loop model and the nature of mRNA 5'--3' communication.
+\textit{Molecular Cell}, 72(5), 805--812.
+
+\bibitem{wilson2011ribosome}
+Wilson, D.N., \& Beckmann, R. (2011).
+The ribosomal tunnel as a functional environment for nascent polypeptide folding and translational stalling.
+\textit{Current Opinion in Structural Biology}, 21(2), 274--282.
+
+\bibitem{kaiser2011emergence}
+Kaiser, C.M., Goldman, D.H., Chodera, J.D., Tinoco Jr., I., \& Bhattacharyya, S. (2011).
+The ribosome modulates nascent protein folding.
+\textit{Science}, 334(6063), 1723--1727.
+
+\bibitem{holtkamp2015cotranslational}
+Holtkamp, W., Kokic, G., J\"{a}ger, M., Mittelstaet, J., Komar, A.A., \& Rodnina, M.V. (2015).
+Cotranslational protein folding on the ribosome monitored in real time.
+\textit{Science}, 350(6264), 1104--1107.
+
+\bibitem{ingolia2009genome}
+Ingolia, N.T., Ghaemmaghami, S., Newman, J.R., \& Weissman, J.S. (2009).
+Genome-wide analysis in vivo of translation with nucleotide resolution using ribosome profiling.
+\textit{Science}, 324(5924), 218--223.
+
+\bibitem{li2020fourier}
+Li, Z., Kovachki, N., Azizzadenesheli, K., Liu, B., Bhattacharya, K., Stuart, A., \& Anandkumar, A. (2020).
+Fourier neural operator for parametric partial differential equations.
+\textit{arXiv preprint arXiv:2010.08895}.
+
+\bibitem{macdonald1968kinetics}
+MacDonald, C.T., Gibbs, J.H., \& Pipkin, A.C. (1968).
+Kinetics of biopolymerization on nucleic acid templates.
+\textit{Biopolymers}, 6(1), 1--25.
+
+\bibitem{shaw2003totally}
+Shaw, L.B., Zia, R.K.P., \& Lee, K.H. (2003).
+Totally asymmetric exclusion process with extended objects.
+\textit{Physical Review E}, 68(2), 021910.
+
+\bibitem{ben2011quantifying}
+Ben-Shem, A., Garreau de Loubresse, N., Melnikov, S., Jenner, L., Yusupova, G., \& Yusupov, M. (2011).
+The structure of the eukaryotic ribosome at 3.0 \AA\ resolution.
+\textit{Science}, 334(6062), 1524--1529.
+
+\bibitem{wolin1988ribosome}
+Wolin, S.L., \& Walter, P. (1988).
+Ribosome pausing and stacking during translation of a eukaryotic mRNA.
+\textit{The EMBO Journal}, 7(11), 3559--3569.
+
+\bibitem{ingolia2011ribosome}
+Ingolia, N.T., Lareau, L.F., \& Weissman, J.S. (2011).
+Ribosome profiling of mouse embryonic stem cells reveals the complexity and dynamics of mammalian proteomes.
+\textit{Cell}, 147(4), 789--802.
+
+\bibitem{shah2013rate}
+Shah, P., Ding, Y., Bhattacharyya, M., \& Bhattacharyya, A. (2013).
+Rate-limiting steps in yeast protein translation.
+\textit{Cell}, 153(7), 1589--1601.
+
+\end{thebibliography}
+
+\end{document}
