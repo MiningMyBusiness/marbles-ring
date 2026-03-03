@@ -6,3 +6,4 @@ torch
 # Optional: gradient-free optimisation for experiment_7b_inverse_fno.py
 # Falls back to scipy.optimize.differential_evolution if not installed.
 cma
+matplotlib
