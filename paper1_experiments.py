@@ -725,6 +725,339 @@ def experiment_3_fno_training(
     return results, fno, train_dataset
 
 
+# =============================================================================
+# EXPERIMENT 3b: CURRICULUM FINE-TUNING (SCHEDULED SAMPLING)
+# =============================================================================
+
+def experiment_3b_fno_curriculum_finetuning(
+    config: ExperimentConfig,
+    fno: FourierNeuralOperator,
+    dataset: Dict,
+    train_dataset: DensityDataset,
+) -> Tuple[Dict, FourierNeuralOperator]:
+    """
+    Fine-tune the pre-trained FNO using scheduled sampling to mitigate the
+    covariate shift that accumulates during autoregressive rollout.
+
+    Problem
+    -------
+    Experiment 3 trains on (ground-truth_t → ground-truth_t+1) pairs.
+    At test time (Experiment 4) the model is rolled out autoregressively,
+    feeding its own outputs back as inputs.  Small one-step errors compound
+    quickly because the model has never seen its own outputs at training time.
+
+    Solution: Scheduled Sampling (Bengio et al., 2015 / DAgger-style)
+    -----------------------------------------------------------------
+    During fine-tuning each input *frame* in the k-history window is drawn
+    from either the ground-truth trajectory or the model's own rollout
+    with probability p_gt (teacher-forcing rate).  p_gt is annealed
+    linearly from 1.0 (pure teacher forcing, identical to Exp 3) down to
+    0.5 (equal mix) over N_ROUNDS curriculum rounds, then held at 0.5.
+
+    Validation and test metrics are reported at p_gt = 0.0 (FNO-only input)
+    to directly measure roll-out robustness.
+
+    Figure 3b: Curriculum fine-tuning dynamics
+    - (a) Fine-tuning loss curves per curriculum round
+    - (b) Val MSE (FNO-input) vs curriculum round
+    - (c) Comparison: original FNO vs curriculum-FNO val MSE (FNO-input)
+
+    Args
+    ----
+    config       : ExperimentConfig
+    fno          : Trained FourierNeuralOperator from experiment_3_fno_training
+    dataset      : Full dataset dict (train / val / test splits)
+    train_dataset: Fitted DensityDataset (provides normalisation stats)
+
+    Returns
+    -------
+    (results, fno_finetuned)
+    """
+    import copy
+    from torch.utils.data import Dataset as TorchDataset
+
+    print("=" * 60)
+    print("EXPERIMENT 3b: Curriculum Fine-Tuning (Scheduled Sampling)")
+    print("=" * 60)
+
+    # ── Hyperparameters ────────────────────────────────────────────────────
+    N_ROUNDS           = 5        # Curriculum rounds
+    EPOCHS_PER_ROUND   = 20       # Fine-tuning epochs per round
+    P_GT_START         = 1.0      # Teacher-forcing prob at round 0
+    P_GT_END           = 0.5      # Teacher-forcing prob at round N_ROUNDS-1
+    BATCH_SIZE         = 64
+    LEARNING_RATE      = 3e-4     # Lower LR for fine-tuning
+    SCHED_PATIENCE     = 5
+    ES_PATIENCE        = 10
+    # ───────────────────────────────────────────────────────────────────────
+
+    results: Dict = {
+        "hyperparameters": {
+            "n_rounds":         N_ROUNDS,
+            "epochs_per_round": EPOCHS_PER_ROUND,
+            "p_gt_start":       P_GT_START,
+            "p_gt_end":         P_GT_END,
+            "learning_rate":    LEARNING_RATE,
+        },
+        "teacher_forcing_schedule": [],
+        "round_histories":          [],
+        "val_mse_fno_input":        [],   # per round, p_gt=0
+        "baseline_val_mse_fno_input": None,  # original FNO before fine-tuning
+        "test_mse_fno_input":       None,
+        "final_metrics":            {},
+    }
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\nUsing device: {device}")
+
+    # ── Helper: convert raw trajectory dicts → DensityTrajectory ──────────
+    def _make_trajectories(traj_list: List[Dict]) -> List[DensityTrajectory]:
+        out = []
+        for traj in traj_list:
+            out.append(DensityTrajectory(
+                time_points=np.array(traj["time_points"]),
+                density_fields=np.array(traj["density_fields"]),
+                delta_t=config.save_interval,
+                system_params={
+                    "n_particles": traj["n_particles"],
+                    "masses":      traj["masses"],
+                    "diameters":   traj["diameters"],
+                },
+            ))
+        return out
+
+    train_trajectories = _make_trajectories(dataset["train"])
+    val_trajectories   = _make_trajectories(dataset["val"])
+    test_trajectories  = _make_trajectories(dataset["test"])
+
+    k = config.k_history
+    in_mean  = train_dataset.input_mean
+    in_std   = train_dataset.input_std
+    out_mean = train_dataset.target_mean
+    out_std  = train_dataset.target_std
+
+    # ── Helper: build normalised rollout cache for a list of trajectories ─
+    def _build_rollout_cache(
+        model: FourierNeuralOperator,
+        trajectories: List[DensityTrajectory],
+    ) -> List[np.ndarray]:
+        """
+        Run model autoregressively over each trajectory and return a list of
+        predicted frames (one array of shape (T, n_bins) per trajectory,
+        in *normalised* space so the cache aligns directly with GT frames).
+        """
+        model.eval()
+        cache = []
+        with torch.no_grad():
+            for traj in trajectories:
+                T   = traj.n_timesteps
+                gt_norm = (traj.density_fields - in_mean) / in_std  # (T, n_bins)
+
+                # Seed with first k ground-truth frames
+                seed = torch.from_numpy(
+                    gt_norm[:k].astype(np.float32)
+                ).unsqueeze(0).to(device)  # (1, k, n_bins)
+
+                # Roll out for remaining T-k steps   → (T-k+1, n_bins) normalised
+                n_rollout = T - k
+                predicted_norm = model.predict_trajectory(seed, n_rollout)  # (T-k+1, n_bins)
+                predicted_norm = predicted_norm.cpu().numpy()
+
+                # Build aligned array of shape (T, n_bins):
+                # frames 0..k-2 come from ground-truth (seed region, not predicted)
+                # frames k-1..T-1 come from rollout
+                rollout_arr = np.empty_like(gt_norm)
+                rollout_arr[:k - 1]  = gt_norm[:k - 1]       # seed region unchanged
+                rollout_arr[k - 1:]  = predicted_norm         # FNO predictions
+
+                cache.append(rollout_arr)
+        model.train()
+        return cache
+
+    # ── Inner Dataset: samples from a mix of GT and rollout frames ─────────
+    class CurriculumDataset(TorchDataset):
+        """
+        Each sample is a (input_window, target) pair where input frames are
+        drawn from ground-truth or rollout according to p_gt.
+
+        p_gt = 1.0 → pure ground-truth (identical to Exp 3)
+        p_gt = 0.0 → pure FNO rollout  (stress-test for Exp 4)
+        """
+
+        def __init__(
+            self,
+            trajectories: List[DensityTrajectory],
+            rollout_cache: List[np.ndarray],
+            p_gt: float,
+        ):
+            self.samples: List[Tuple[np.ndarray, np.ndarray]] = []
+
+            for traj, rollout in zip(trajectories, rollout_cache):
+                T      = traj.n_timesteps
+                gt_n   = (traj.density_fields - in_mean) / in_std   # (T, n_bins)
+                gt_t   = (traj.density_fields - out_mean) / out_std  # (T, n_bins)
+
+                for t in range(k, T):
+                    # Build input window of k frames ending at t-1
+                    window = np.empty((k, traj.n_bins), dtype=np.float32)
+                    for j in range(k):
+                        frame_idx = t - k + j
+                        if np.random.random() < p_gt:
+                            window[j] = gt_n[frame_idx]
+                        else:
+                            window[j] = rollout[frame_idx]
+
+                    target = gt_t[t].astype(np.float32)
+                    self.samples.append((window, target))
+
+        def __len__(self) -> int:
+            return len(self.samples)
+
+        def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+            inp, tgt = self.samples[idx]
+            return torch.from_numpy(inp), torch.from_numpy(tgt)
+
+    # ── Helper: evaluate MSE on FNO-only inputs (p_gt=0) ──────────────────
+    def _eval_fno_input_mse(
+        model: FourierNeuralOperator,
+        trajectories: List[DensityTrajectory],
+        rollout_cache: List[np.ndarray],
+    ) -> float:
+        """Compute mean per-step MSE when inputs are pure FNO rollout frames."""
+        model.eval()
+        total_mse, total_n = 0.0, 0
+        with torch.no_grad():
+            for traj, rollout in zip(trajectories, rollout_cache):
+                T    = traj.n_timesteps
+                gt_t = (traj.density_fields - out_mean) / out_std  # (T, n_bins)
+
+                for t in range(k, T):
+                    # Window built entirely from rollout
+                    window = rollout[t - k: t].astype(np.float32)  # (k, n_bins)
+                    inp    = torch.from_numpy(window).unsqueeze(0).to(device)
+                    pred, _ = model(inp)                            # (1, n_bins)
+                    pred_np  = pred.squeeze(0).cpu().numpy()
+                    mse      = float(np.mean((pred_np - gt_t[t]) ** 2))
+                    total_mse += mse
+                    total_n   += 1
+        model.train()
+        return total_mse / max(total_n, 1)
+
+    # ── Measure baseline (original FNO) before any fine-tuning ────────────
+    print("\nBuilding initial rollout caches...")
+    train_rollout_cache = _build_rollout_cache(fno.to(device), train_trajectories)
+    val_rollout_cache   = _build_rollout_cache(fno.to(device), val_trajectories)
+
+    print("Measuring baseline (pre-fine-tuning) val MSE on FNO-only input...")
+    baseline_val_mse = _eval_fno_input_mse(fno.to(device), val_trajectories, val_rollout_cache)
+    results["baseline_val_mse_fno_input"] = float(baseline_val_mse)
+    print(f"  Baseline val MSE (FNO input): {baseline_val_mse:.6f}")
+
+    # ── Curriculum loop ────────────────────────────────────────────────────
+    fno_ft = copy.deepcopy(fno).to(device)
+    ft_checkpoint = os.path.join(config.output_dir, "fno_finetuned_checkpoint.pt")
+
+    p_gt_values = np.linspace(P_GT_START, P_GT_END, N_ROUNDS).tolist()
+    results["teacher_forcing_schedule"] = p_gt_values
+
+    for rnd in range(N_ROUNDS):
+        p_gt = p_gt_values[rnd]
+        print(f"\n── Round {rnd + 1}/{N_ROUNDS}  (p_gt = {p_gt:.2f}) ──")
+
+        # Rebuild dataset with current mixing ratio
+        curr_train_ds = CurriculumDataset(
+            train_trajectories, train_rollout_cache, p_gt=p_gt
+        )
+        curr_train_loader = DataLoader(
+            curr_train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0
+        )
+
+        # Build a pure-GT val loader (to track "standard" val loss alongside)
+        val_gt_ds = CurriculumDataset(
+            val_trajectories, val_rollout_cache, p_gt=1.0
+        )
+        val_gt_loader = DataLoader(
+            val_gt_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0
+        )
+
+        # Fine-tuning pass for this round
+        rnd_checkpoint = os.path.join(
+            config.output_dir, f"fno_ft_round_{rnd + 1}.pt"
+        )
+        history_rnd = train_fno(
+            model                  = fno_ft,
+            train_loader           = curr_train_loader,
+            val_loader             = val_gt_loader,
+            n_epochs               = EPOCHS_PER_ROUND,
+            learning_rate          = LEARNING_RATE,
+            device                 = device,
+            scheduler_patience     = SCHED_PATIENCE,
+            early_stopping_patience= ES_PATIENCE,
+            checkpoint_path        = rnd_checkpoint,
+            use_mass_conservation  = config.use_mass_conservation,
+            use_positivity         = config.use_positivity,
+            mass_weight            = config.mass_weight,
+            positivity_weight      = config.positivity_weight,
+        )
+
+        # Load best checkpoint for this round before measuring val MSE
+        if os.path.exists(rnd_checkpoint):
+            ckpt = torch.load(rnd_checkpoint, map_location=device)
+            fno_ft.load_state_dict(ckpt["model_state_dict"])
+
+        # Rebuild rollout caches with the (now improved) fine-tuned model
+        train_rollout_cache = _build_rollout_cache(fno_ft, train_trajectories)
+        val_rollout_cache   = _build_rollout_cache(fno_ft, val_trajectories)
+
+        # Evaluate on FNO-only input (the metric that matters)
+        rnd_val_mse = _eval_fno_input_mse(fno_ft, val_trajectories, val_rollout_cache)
+        results["val_mse_fno_input"].append(float(rnd_val_mse))
+
+        results["round_histories"].append({
+            "round":               rnd + 1,
+            "p_gt":                p_gt,
+            "train_loss_history":  [float(v) for v in history_rnd["train_loss"]],
+            "val_loss_history":    [float(v) for v in history_rnd["val_loss"]],
+            "val_mse_fno_input":   float(rnd_val_mse),
+        })
+
+        print(f"  Val MSE (FNO-only input): {rnd_val_mse:.6f}  "
+              f"(baseline was {baseline_val_mse:.6f})")
+
+    # ── Final evaluation on test split ─────────────────────────────────────
+    print("\nBuilding test rollout cache...")
+    test_rollout_cache = _build_rollout_cache(fno_ft, test_trajectories)
+
+    print("Evaluating test MSE (FNO-only input)...")
+    test_mse = _eval_fno_input_mse(fno_ft, test_trajectories, test_rollout_cache)
+    results["test_mse_fno_input"] = float(test_mse)
+    print(f"  Test MSE (FNO-only input):  {test_mse:.6f}")
+
+    # Compare against baseline on val (for a clean summary)
+    final_val_mse = results["val_mse_fno_input"][-1]
+    improvement   = (baseline_val_mse - final_val_mse) / (baseline_val_mse + 1e-12) * 100
+    results["final_metrics"] = {
+        "baseline_val_mse_fno_input": float(baseline_val_mse),
+        "final_val_mse_fno_input":    float(final_val_mse),
+        "improvement_pct":            float(improvement),
+        "test_mse_fno_input":         float(test_mse),
+        "n_rounds_completed":         N_ROUNDS,
+        "device_used":                device,
+    }
+
+    print("\n" + "─" * 60)
+    print(f"  Baseline val MSE (FNO input) : {baseline_val_mse:.6f}")
+    print(f"  Final    val MSE (FNO input) : {final_val_mse:.6f}  "
+          f"({'↓' if improvement > 0 else '↑'}{abs(improvement):.1f}%)")
+    print(f"  Test     MSE (FNO input)     : {test_mse:.6f}")
+    print("─" * 60)
+
+    # ── Save the fine-tuned checkpoint ─────────────────────────────────────
+    save_model(fno_ft, ft_checkpoint, metadata={"config": asdict(config)})
+    print(f"  Fine-tuned checkpoint saved to {ft_checkpoint}")
+
+    return results, fno_ft
+
 
 # =============================================================================
 # EXPERIMENT 4: LYAPUNOV HORIZON BYPASS
@@ -1640,8 +1973,8 @@ def run_all_experiments(
           f"sim_time={config.simulation_time}s")
     print("=" * 70)
 
-    # 9 phases: exps 1–7 + 7b + save
-    timer = RunTimer(total_experiments=9)
+    # 10 phases: exps 1–7 + 3b + 7b + save
+    timer = RunTimer(total_experiments=10)
     all_results: Dict = {}
 
     # ------------------------------------------------------------------
@@ -1686,13 +2019,30 @@ def run_all_experiments(
     print(f"  FNO checkpoint saved to {model_path}")
 
     # ------------------------------------------------------------------
-    # Experiment 4: Lyapunov bypass
+    # Experiment 3b: Curriculum fine-tuning
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("RUNNING EXPERIMENT 3b: Curriculum Fine-Tuning (Scheduled Sampling)")
+    print("=" * 70)
+    t0 = timer.start("Exp 3b: Curriculum Fine-Tuning")
+    finetuning_results, fno_finetuned = experiment_3b_fno_curriculum_finetuning(
+        config, fno, dataset, train_dataset
+    )
+    all_results["experiment_3b_curriculum"] = finetuning_results
+    timer.stop("Exp 3b: Curriculum Fine-Tuning", t0)
+
+    finetuned_path = os.path.join(run_dir, "fno_finetuned_checkpoint.pt")
+    save_model(fno_finetuned, finetuned_path, metadata={"config": asdict(config)})
+    print(f"  Fine-tuned FNO checkpoint saved to {finetuned_path}")
+
+    # ------------------------------------------------------------------
+    # Experiment 4: Lyapunov bypass  (uses curriculum-fine-tuned model)
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("RUNNING EXPERIMENT 4: Lyapunov Horizon Bypass")
     print("=" * 70)
     t0 = timer.start("Exp 4: Lyapunov Bypass")
-    bypass_results = experiment_4_lyapunov_bypass(config, fno, dataset, train_dataset)
+    bypass_results = experiment_4_lyapunov_bypass(config, fno_finetuned, dataset, train_dataset)
     all_results["experiment_4_bypass"] = bypass_results
     timer.stop("Exp 4: Lyapunov Bypass", t0)
 
