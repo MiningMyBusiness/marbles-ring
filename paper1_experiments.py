@@ -1157,10 +1157,12 @@ def experiment_4_lyapunov_bypass(
 
                 # Align predicted[n_steps] with ground-truth frame k-1+n_steps
                 true_idx = (k - 1) + n_steps
-                if n_steps < len(predicted) and true_idx < traj.n_timesteps:
-                    pred_final = predicted[n_steps]
-                    true_final = traj.density_fields[true_idx]
-                
+                if n_steps >= len(predicted) or true_idx >= traj.n_timesteps:
+                    continue  # skip — horizon exceeds available data for this trajectory
+
+                pred_final = predicted[n_steps]
+                true_final = traj.density_fields[true_idx]
+
                 # Compute metrics
                 mse = np.mean((pred_final - true_final) ** 2)
 
@@ -1283,14 +1285,20 @@ def experiment_5_ablations(config: ExperimentConfig, dataset: Dict, train_datase
     val_dataset_abl.target_std  = train_dataset.target_std
     val_loader_abl = DataLoader(val_dataset_abl, batch_size=64, shuffle=False, num_workers=0)
     
+    # Default ablation values must match ExperimentConfig (n_modes=32, hidden_channels=64, n_layers=4).
+    # Each variant changes exactly ONE axis so that differences isolate a single factor.
+    default_modes    = config.fno_modes            # 32
+    default_channels = config.fno_hidden_channels  # 64
+    default_layers   = config.fno_layers           # 4
+
     ablation_configs = [
-        {'name': 'Full model (default)', 'n_modes': 16, 'hidden_channels': 32, 'n_layers': 4},
-        {'name': 'Fewer modes (8)',       'n_modes': 8,  'hidden_channels': 32, 'n_layers': 4},
-        {'name': 'More modes (32)',       'n_modes': 32, 'hidden_channels': 32, 'n_layers': 4},
-        {'name': 'Shallow (2 layers)',    'n_modes': 16, 'hidden_channels': 32, 'n_layers': 2},
-        {'name': 'Deep (6 layers)',       'n_modes': 16, 'hidden_channels': 32, 'n_layers': 6},
-        {'name': 'Narrow (16 channels)', 'n_modes': 16, 'hidden_channels': 16, 'n_layers': 4},
-        {'name': 'Wide (64 channels)',   'n_modes': 16, 'hidden_channels': 64, 'n_layers': 4},
+        {'name': 'Full model (default)',  'n_modes': default_modes,    'hidden_channels': default_channels, 'n_layers': default_layers},
+        {'name': 'Fewer modes (8)',       'n_modes': 8,                'hidden_channels': default_channels, 'n_layers': default_layers},
+        {'name': 'More modes (48)',       'n_modes': 48,               'hidden_channels': default_channels, 'n_layers': default_layers},
+        {'name': 'Shallow (2 layers)',    'n_modes': default_modes,    'hidden_channels': default_channels, 'n_layers': 2},
+        {'name': 'Deep (6 layers)',       'n_modes': default_modes,    'hidden_channels': default_channels, 'n_layers': 6},
+        {'name': 'Narrow (32 channels)',  'n_modes': default_modes,    'hidden_channels': 32,               'n_layers': default_layers},
+        {'name': 'Wide (128 channels)',   'n_modes': default_modes,    'hidden_channels': 128,              'n_layers': default_layers},
     ]
     
     for abl in ablation_configs:
@@ -1404,7 +1412,7 @@ def experiment_6_baselines(config: ExperimentConfig, dataset: Dict) -> Dict:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"\nUsing device: {device}")
     
-    # Prepare data
+    # Prepare single-frame data (for simple baselines: persistence, mean, linear, MLP)
     def prepare_data(trajectories):
         inputs, targets = [], []
         for traj in trajectories:
@@ -1413,12 +1421,29 @@ def experiment_6_baselines(config: ExperimentConfig, dataset: Dict) -> Dict:
                 inputs.append(df[t])
                 targets.append(df[t + 1])
         return np.array(inputs), np.array(targets)
-    
+
+    # Prepare k-frame windowed data (for LSTM and U-Net — matches FNO input format)
+    def prepare_windowed_data(trajectories, k_history: int = 4):
+        inputs, targets = [], []
+        for traj in trajectories:
+            df = np.array(traj['density_fields'])
+            for t in range(len(df) - k_history):
+                inputs.append(df[t: t + k_history])          # (k_history, n_bins)
+                targets.append(df[t + k_history])             # (n_bins,)
+        return np.array(inputs), np.array(targets)
+
+    k_history = config.k_history
+
     train_inputs, train_targets = prepare_data(dataset['train'])
     val_inputs, val_targets = prepare_data(dataset['val'])
-    
-    print(f"\n  Training samples: {len(train_inputs)}")
-    print(f"  Validation samples: {len(val_inputs)}")
+
+    train_inputs_w, train_targets_w = prepare_windowed_data(dataset['train'], k_history)
+    val_inputs_w, val_targets_w = prepare_windowed_data(dataset['val'], k_history)
+
+    print(f"\n  Single-frame training samples: {len(train_inputs)}")
+    print(f"  Single-frame validation samples: {len(val_inputs)}")
+    print(f"  Windowed (k={k_history}) training samples: {len(train_inputs_w)}")
+    print(f"  Windowed (k={k_history}) validation samples: {len(val_inputs_w)}")
     
     # =========================================================================
     # Simple Baselines (no training required)
@@ -1483,7 +1508,12 @@ def experiment_6_baselines(config: ExperimentConfig, dataset: Dict) -> Dict:
     # =========================================================================
     # Neural Network Baselines (require training)
     # =========================================================================
-    
+    #
+    # LSTM and U-Net receive the same k-frame windowed input as the FNO so
+    # that all learned baselines have identical temporal context.  This is a
+    # fair comparison: same information, different architectures.
+    # =========================================================================
+
     # Convert to PyTorch datasets
     def create_torch_datasets(train_in, train_tgt, val_in, val_tgt):
         train_dataset = torch.utils.data.TensorDataset(
@@ -1497,54 +1527,57 @@ def experiment_6_baselines(config: ExperimentConfig, dataset: Dict) -> Dict:
         train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
         return train_loader, val_loader
-    
-    train_loader, val_loader = create_torch_datasets(
-        train_inputs, train_targets, val_inputs, val_targets
+
+    # Windowed loaders for LSTM and U-Net (shape: batch, k_history, n_bins)
+    train_loader_w, val_loader_w = create_torch_datasets(
+        train_inputs_w, train_targets_w, val_inputs_w, val_targets_w
     )
-    
-    # Baseline 5: LSTM
-    print("\n  [5/8] LSTM baseline...")
+
+    # Baseline 5: LSTM (k-frame windowed input)
+    print(f"\n  [5/8] LSTM baseline (k={k_history} frame input)...")
     lstm = LSTMDensityPredictor(
         n_bins=config.n_density_bins,
         hidden_dim=256,
-        n_layers=2
+        n_layers=2,
+        k_history=k_history
     )
     history_lstm = train_baseline_model(
-        lstm, train_loader, val_loader,
+        lstm, train_loader_w, val_loader_w,
         n_epochs=50, learning_rate=1e-3, device=device
     )
-    
+
     lstm.eval()
     lstm_losses = []
     with torch.no_grad():
-        for inputs, targets in val_loader:
+        for inputs, targets in val_loader_w:
             inputs, targets = inputs.to(device), targets.to(device)
             preds = lstm(inputs)
             loss = F.mse_loss(preds, targets)
             lstm_losses.append(loss.item())
     lstm_mse = np.mean(lstm_losses)
-    
+
     results['baselines'].append({
         'name': 'LSTM',
         'mse': float(lstm_mse),
-        'description': '2-layer LSTM, 256 hidden units',
+        'description': f'2-layer LSTM, 256 hidden, k={k_history} frame input',
         'type': 'neural',
         'n_parameters': sum(p.numel() for p in lstm.parameters())
     })
     print(f"       MSE: {lstm_mse:.6f}, Params: {results['baselines'][-1]['n_parameters']:,}")
-    
-    # Baseline 6: U-Net
-    print("\n  [6/8] U-Net baseline...")
-    unet = UNet1D(n_bins=config.n_density_bins, base_channels=32)
+
+    # Baseline 6: U-Net (k-frame windowed input as multi-channel)
+    print(f"\n  [6/8] U-Net baseline (k={k_history} channel input)...")
+    unet = UNet1D(n_bins=config.n_density_bins, base_channels=32,
+                  in_channels=k_history)
     history_unet = train_baseline_model(
-        unet, train_loader, val_loader,
+        unet, train_loader_w, val_loader_w,
         n_epochs=50, learning_rate=1e-3, device=device
     )
-    
+
     unet.eval()
     unet_losses = []
     with torch.no_grad():
-        for inputs, targets in val_loader:
+        for inputs, targets in val_loader_w:
             inputs, targets = inputs.to(device), targets.to(device)
             preds = unet(inputs)
             loss = F.mse_loss(preds, targets)
@@ -1554,7 +1587,7 @@ def experiment_6_baselines(config: ExperimentConfig, dataset: Dict) -> Dict:
     results['baselines'].append({
         'name': 'U-Net',
         'mse': float(unet_mse),
-        'description': '1D U-Net with skip connections',
+        'description': f'1D U-Net with skip connections, k={k_history} channel input',
         'type': 'neural',
         'n_parameters': sum(p.numel() for p in unet.parameters())
     })
@@ -1837,6 +1870,554 @@ def experiment_7_inverse_problem(config: ExperimentConfig, dataset: Dict) -> Dic
 
 
 # =============================================================================
+# EXPERIMENT 8: GRID CONVERGENCE STUDY
+# =============================================================================
+
+def experiment_8_grid_convergence(
+    config: ExperimentConfig,
+    dataset: Dict,
+) -> Dict:
+    """
+    Grid convergence study: train and evaluate at multiple spatial resolutions.
+
+    JCP reviewers expect to see that the learned operator converges as the
+    discretisation is refined.  We re-bin the *same* trajectory data at
+    n ∈ {64, 128, 256, 512} and train separate FNO instances at each
+    resolution, reporting single-step MSE and multi-step rollout error.
+
+    Table / Figure: relative L2 error vs spatial resolution n.
+    """
+    print("=" * 60)
+    print("EXPERIMENT 8: Grid Convergence Study")
+    print("=" * 60)
+
+    resolutions = [64, 128, 256, 512]
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\nUsing device: {device}")
+
+    results = {
+        'resolutions': [],
+    }
+
+    # ── Helper: re-bin a trajectory's density fields to a new resolution ──
+    def rebin_trajectory(traj: Dict, n_bins_new: int) -> Dict:
+        """Resample density fields from their original resolution to n_bins_new."""
+        import copy
+        traj_new = copy.deepcopy(traj)
+        df = np.array(traj['density_fields'])            # (T, n_bins_orig)
+        n_bins_orig = df.shape[1]
+
+        if n_bins_new == n_bins_orig:
+            return traj_new
+
+        # Linear interpolation to new grid
+        x_orig = np.linspace(0, 1, n_bins_orig)
+        x_new  = np.linspace(0, 1, n_bins_new)
+        rebinned = np.array([np.interp(x_new, x_orig, row) for row in df])
+
+        # Rescale so that total mass (sum * bin_width) is conserved
+        scale = n_bins_orig / n_bins_new
+        rebinned *= scale
+
+        traj_new['density_fields'] = rebinned.tolist()
+        return traj_new
+
+    for n_bins in resolutions:
+        print(f"\n── Resolution n = {n_bins} ──")
+
+        # Re-bin dataset
+        print("  Re-binning dataset...")
+        ds_rebinned = {
+            split: [rebin_trajectory(t, n_bins) for t in dataset[split]]
+            for split in ('train', 'val', 'test')
+        }
+
+        # Build DensityTrajectory objects
+        def to_dt(traj_list):
+            return [
+                DensityTrajectory(
+                    time_points=np.array(t['time_points']),
+                    density_fields=np.array(t['density_fields']),
+                    delta_t=config.save_interval,
+                )
+                for t in traj_list
+            ]
+
+        train_traj = to_dt(ds_rebinned['train'])
+        val_traj   = to_dt(ds_rebinned['val'])
+        test_traj  = to_dt(ds_rebinned['test'])
+
+        train_ds = DensityDataset(train_traj, n_steps_ahead=1, normalize=True,
+                                  k_history=config.k_history)
+        val_ds   = DensityDataset(val_traj,   n_steps_ahead=1, normalize=True,
+                                  k_history=config.k_history)
+        val_ds.input_mean  = train_ds.input_mean
+        val_ds.input_std   = train_ds.input_std
+        val_ds.target_mean = train_ds.target_mean
+        val_ds.target_std  = train_ds.target_std
+
+        train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=0)
+        val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False, num_workers=0)
+
+        # Keep n_modes <= n_bins // 2 (Nyquist limit)
+        n_modes = min(config.fno_modes, n_bins // 2)
+
+        print(f"  Training FNO (modes={n_modes}, samples={len(train_ds)})...")
+        fno_res = FourierNeuralOperator(
+            n_bins=n_bins,
+            n_modes=n_modes,
+            hidden_channels=config.fno_hidden_channels,
+            n_layers=config.fno_layers,
+            delta_t=config.save_interval,
+            k_history=config.k_history,
+            lstm_hidden=config.lstm_hidden,
+            lstm_layers=config.lstm_layers,
+        )
+
+        ckpt_path = os.path.join(config.output_dir, f"fno_grid_n{n_bins}.pt")
+        history = train_fno(
+            model=fno_res,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            n_epochs=50,
+            learning_rate=1e-3,
+            device=device,
+            scheduler_patience=5,
+            early_stopping_patience=10,
+            checkpoint_path=ckpt_path,
+        )
+
+        # Load best checkpoint
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device)
+            fno_res.load_state_dict(ckpt['model_state_dict'])
+
+        # Evaluate single-step MSE on validation set
+        fno_res.eval()
+        val_losses = []
+        with torch.no_grad():
+            for inp, tgt in val_loader:
+                inp, tgt = inp.to(device), tgt.to(device)
+                loss = fno_res.compute_loss(inp, tgt)
+                val_losses.append(loss.item())
+        single_step_mse = float(np.mean(val_losses))
+
+        # Evaluate multi-step rollout (10 steps) on first 10 test trajectories
+        rollout_mses = []
+        n_rollout_steps = 10
+        fno_res.eval()
+        with torch.no_grad():
+            for traj in test_traj[:10]:
+                k = config.k_history
+                if traj.n_timesteps < k + n_rollout_steps:
+                    continue
+                seed = traj.density_fields[:k]
+                seed_norm = (seed - train_ds.input_mean) / train_ds.input_std
+                seed_t = torch.from_numpy(seed_norm.astype(np.float32)).to(device)
+
+                pred_norm = fno_res.predict_trajectory(seed_t, n_rollout_steps)
+                pred = train_ds.denormalize_output(pred_norm).cpu().numpy()
+
+                true_idx = k - 1 + n_rollout_steps
+                if true_idx < traj.n_timesteps and n_rollout_steps < len(pred):
+                    mse = float(np.mean((pred[n_rollout_steps] - traj.density_fields[true_idx]) ** 2))
+                    rollout_mses.append(mse)
+
+        rollout_mse = float(np.mean(rollout_mses)) if rollout_mses else float('nan')
+
+        entry = {
+            'n_bins': n_bins,
+            'n_modes': n_modes,
+            'single_step_mse': single_step_mse,
+            'best_val_loss': float(min(history['val_loss'])),
+            'rollout_10step_mse': rollout_mse,
+            'n_parameters': sum(p.numel() for p in fno_res.parameters()),
+            'n_epochs_trained': len(history['train_loss']),
+        }
+        results['resolutions'].append(entry)
+
+        print(f"  Single-step MSE: {single_step_mse:.6f}")
+        print(f"  10-step rollout MSE: {rollout_mse:.6f}")
+        print(f"  Parameters: {entry['n_parameters']:,}")
+
+    # Summary table
+    print("\n" + "=" * 70)
+    print("GRID CONVERGENCE SUMMARY")
+    print("=" * 70)
+    print(f"  {'n_bins':>6}  {'1-step MSE':>12}  {'10-step MSE':>12}  {'Params':>10}")
+    print("  " + "-" * 46)
+    for r in results['resolutions']:
+        print(f"  {r['n_bins']:>6}  {r['single_step_mse']:>12.6f}  "
+              f"{r['rollout_10step_mse']:>12.6f}  {r['n_parameters']:>10,}")
+
+    return results
+
+
+# =============================================================================
+# EXPERIMENT 9: MULTI-SEED TRAINING (Statistical Confidence)
+# =============================================================================
+
+def experiment_9_multi_seed(
+    config: ExperimentConfig,
+    dataset: Dict,
+    n_seeds: int = 3,
+) -> Dict:
+    """
+    Train the FNO with multiple random seeds to obtain confidence intervals.
+
+    This addresses the methods claim (line 474) about independent training runs.
+    We train n_seeds models from scratch with different initialisations and
+    report mean ± std of validation loss and multi-step rollout metrics.
+
+    Table: per-seed val loss, mean, std.
+    """
+    print("=" * 60)
+    print(f"EXPERIMENT 9: Multi-Seed Training ({n_seeds} seeds)")
+    print("=" * 60)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\nUsing device: {device}")
+
+    results = {
+        'n_seeds': n_seeds,
+        'seeds': [],
+        'summary': {},
+    }
+
+    # Build data loaders (shared across all seeds — only model init changes)
+    def to_dt(traj_list):
+        return [
+            DensityTrajectory(
+                time_points=np.array(t['time_points']),
+                density_fields=np.array(t['density_fields']),
+                delta_t=config.save_interval,
+            )
+            for t in traj_list
+        ]
+
+    train_traj = to_dt(dataset['train'])
+    val_traj   = to_dt(dataset['val'])
+    test_traj  = to_dt(dataset['test'])
+
+    train_ds = DensityDataset(train_traj, n_steps_ahead=1, normalize=True,
+                              k_history=config.k_history)
+    val_ds   = DensityDataset(val_traj,   n_steps_ahead=1, normalize=True,
+                              k_history=config.k_history)
+    val_ds.input_mean  = train_ds.input_mean
+    val_ds.input_std   = train_ds.input_std
+    val_ds.target_mean = train_ds.target_mean
+    val_ds.target_std  = train_ds.target_std
+
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False, num_workers=0)
+
+    best_val_losses = []
+    rollout_mses_all = []
+
+    for seed_idx in range(n_seeds):
+        model_seed = config.seed + seed_idx * 1000
+        print(f"\n── Seed {seed_idx + 1}/{n_seeds}  (torch seed = {model_seed}) ──")
+
+        torch.manual_seed(model_seed)
+        np.random.seed(model_seed)
+
+        fno_s = FourierNeuralOperator(
+            n_bins=config.n_density_bins,
+            n_modes=config.fno_modes,
+            hidden_channels=config.fno_hidden_channels,
+            n_layers=config.fno_layers,
+            delta_t=config.save_interval,
+            k_history=config.k_history,
+            lstm_hidden=config.lstm_hidden,
+            lstm_layers=config.lstm_layers,
+        )
+
+        ckpt_path = os.path.join(config.output_dir, f"fno_seed{seed_idx}.pt")
+        history = train_fno(
+            model=fno_s,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            n_epochs=100,
+            learning_rate=1e-3,
+            device=device,
+            scheduler_patience=10,
+            early_stopping_patience=20,
+            checkpoint_path=ckpt_path,
+        )
+
+        # Load best checkpoint
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device)
+            fno_s.load_state_dict(ckpt['model_state_dict'])
+
+        best_val = float(min(history['val_loss']))
+        best_val_losses.append(best_val)
+
+        # Multi-step rollout evaluation on test set
+        fno_s.eval()
+        k = config.k_history
+        horizon_factors = [1.0, 2.0, 5.0, 10.0]
+
+        # Compute Lyapunov times from test set
+        lyapunov_times = []
+        for traj in dataset['test'][:10]:
+            system = ParticleSystem(config.track_length)
+            for i, (m, d, v) in enumerate(zip(traj['masses'], traj['diameters'], traj['initial_velocities'])):
+                system.add_particle(
+                    position=config.track_length * i / len(traj['masses']),
+                    velocity=v, diameter=d, mass=m
+                )
+            lyap = system.compute_lyapunov_exponent(perturbation=1e-8, duration=50.0)
+            if lyap > 0:
+                lyapunov_times.append(1.0 / lyap)
+        mean_lyap_time = np.mean(lyapunov_times) if lyapunov_times else 10.0
+
+        seed_rollout = {}
+        with torch.no_grad():
+            for hf in horizon_factors:
+                n_steps = int(hf * mean_lyap_time / config.save_interval)
+                mses = []
+                for traj in test_traj[:20]:
+                    if traj.n_timesteps < k + n_steps:
+                        continue
+                    seed_frames = traj.density_fields[:k]
+                    seed_norm = (seed_frames - train_ds.input_mean) / train_ds.input_std
+                    seed_t = torch.from_numpy(seed_norm.astype(np.float32)).to(device)
+                    pred_norm = fno_s.predict_trajectory(seed_t, n_steps)
+                    pred = train_ds.denormalize_output(pred_norm).cpu().numpy()
+                    true_idx = (k - 1) + n_steps
+                    if n_steps < len(pred) and true_idx < traj.n_timesteps:
+                        mse = float(np.mean((pred[n_steps] - traj.density_fields[true_idx]) ** 2))
+                        mses.append(mse)
+                seed_rollout[str(hf)] = float(np.mean(mses)) if mses else float('nan')
+
+        rollout_mses_all.append(seed_rollout)
+
+        seed_entry = {
+            'seed': model_seed,
+            'best_val_loss': best_val,
+            'n_epochs_trained': len(history['train_loss']),
+            'rollout_mses': seed_rollout,
+        }
+        results['seeds'].append(seed_entry)
+        print(f"  Best val loss: {best_val:.6f}")
+        for hf, mse in seed_rollout.items():
+            print(f"  Rollout {hf}x Lyap: MSE = {mse:.6f}")
+
+    # Summary statistics
+    results['summary'] = {
+        'val_loss_mean': float(np.mean(best_val_losses)),
+        'val_loss_std': float(np.std(best_val_losses)),
+        'val_loss_min': float(np.min(best_val_losses)),
+        'val_loss_max': float(np.max(best_val_losses)),
+    }
+
+    # Aggregate rollout MSEs across seeds per horizon
+    for hf_str in [str(hf) for hf in horizon_factors]:
+        vals = [r[hf_str] for r in rollout_mses_all if not np.isnan(r.get(hf_str, float('nan')))]
+        if vals:
+            results['summary'][f'rollout_{hf_str}x_mean'] = float(np.mean(vals))
+            results['summary'][f'rollout_{hf_str}x_std'] = float(np.std(vals))
+
+    print("\n" + "=" * 60)
+    print("MULTI-SEED SUMMARY")
+    print("=" * 60)
+    print(f"  Val loss: {results['summary']['val_loss_mean']:.6f} "
+          f"± {results['summary']['val_loss_std']:.6f}")
+    for hf_str in [str(hf) for hf in horizon_factors]:
+        mean_key = f'rollout_{hf_str}x_mean'
+        std_key = f'rollout_{hf_str}x_std'
+        if mean_key in results['summary']:
+            print(f"  Rollout {hf_str}x Lyap: "
+                  f"{results['summary'][mean_key]:.6f} ± {results['summary'][std_key]:.6f}")
+
+    return results
+
+
+# =============================================================================
+# EXPERIMENT 10: COMPUTATIONAL COST PROFILING
+# =============================================================================
+
+def experiment_10_computational_cost(
+    config: ExperimentConfig,
+    dataset: Dict,
+) -> Dict:
+    """
+    Measure wall-clock timings for the physics simulator and the trained FNO.
+
+    JCP reviewers expect a clear speedup table showing:
+      1. Event-driven simulation time for one trajectory
+      2. FNO single-step inference time
+      3. FNO multi-step rollout time (100 and 500 steps)
+      4. Speedup factor
+
+    All timings are averaged over multiple repetitions for stability.
+    """
+    print("=" * 60)
+    print("EXPERIMENT 10: Computational Cost Profiling")
+    print("=" * 60)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\nUsing device: {device}")
+
+    results = {
+        'device': device,
+        'simulator': {},
+        'fno_inference': {},
+        'speedup': {},
+    }
+
+    # ── 1. Physics simulator timing ──────────────────────────────────────
+    print("\n1. Timing physics simulator...")
+
+    sim_durations_per_step = []
+    n_sim_trials = 5
+    for trial in range(n_sim_trials):
+        system = create_random_system(
+            n_particles=8,
+            track_length=config.track_length,
+            seed=config.seed + trial
+        )
+        t_start = time.perf_counter()
+        system.evolve(duration=config.simulation_time, save_interval=config.save_interval)
+        t_end = time.perf_counter()
+
+        n_steps_sim = int(config.simulation_time / config.save_interval)
+        per_step = (t_end - t_start) / n_steps_sim
+        sim_durations_per_step.append(per_step)
+
+    results['simulator'] = {
+        'n_trials': n_sim_trials,
+        'simulation_time': config.simulation_time,
+        'n_steps': int(config.simulation_time / config.save_interval),
+        'total_time_mean_s': float(np.mean(sim_durations_per_step) * int(config.simulation_time / config.save_interval)),
+        'per_step_mean_ms': float(np.mean(sim_durations_per_step) * 1000),
+        'per_step_std_ms': float(np.std(sim_durations_per_step) * 1000),
+    }
+    print(f"  Simulator: {results['simulator']['per_step_mean_ms']:.3f} "
+          f"± {results['simulator']['per_step_std_ms']:.3f} ms/step  "
+          f"(total: {results['simulator']['total_time_mean_s']:.2f} s for "
+          f"{results['simulator']['n_steps']} steps)")
+
+    # ── 2. Load or build a trained FNO ───────────────────────────────────
+    print("\n2. Loading trained FNO for inference timing...")
+
+    # Try to find an existing checkpoint
+    ckpt_path = os.path.join(config.output_dir, 'fno_checkpoint.pt')
+    fno = FourierNeuralOperator(
+        n_bins=config.n_density_bins,
+        n_modes=config.fno_modes,
+        hidden_channels=config.fno_hidden_channels,
+        n_layers=config.fno_layers,
+        delta_t=config.save_interval,
+        k_history=config.k_history,
+        lstm_hidden=config.lstm_hidden,
+        lstm_layers=config.lstm_layers,
+    ).to(device)
+
+    if os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=device)
+        fno.load_state_dict(ckpt['model_state_dict'])
+        print(f"  Loaded checkpoint from {ckpt_path}")
+    else:
+        print(f"  WARNING: No checkpoint at {ckpt_path}, using random weights (timings still valid)")
+
+    fno.eval()
+
+    # ── 3. FNO single-step inference timing ──────────────────────────────
+    print("\n3. Timing FNO single-step inference...")
+    k = config.k_history
+    dummy_input = torch.randn(1, k, config.n_density_bins, device=device)
+
+    # Warmup
+    for _ in range(10):
+        with torch.no_grad():
+            fno(dummy_input)
+    if device == 'cuda':
+        torch.cuda.synchronize()
+
+    n_timing_reps = 100
+    t_start = time.perf_counter()
+    for _ in range(n_timing_reps):
+        with torch.no_grad():
+            fno(dummy_input)
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    t_end = time.perf_counter()
+
+    single_step_ms = (t_end - t_start) / n_timing_reps * 1000
+    results['fno_inference']['single_step_ms'] = float(single_step_ms)
+    print(f"  FNO single-step: {single_step_ms:.3f} ms")
+
+    # ── 4. FNO multi-step rollout timing ─────────────────────────────────
+    print("\n4. Timing FNO multi-step rollout...")
+
+    seed_window = torch.randn(k, config.n_density_bins, device=device)
+
+    for n_rollout in [100, 500]:
+        # Warmup
+        with torch.no_grad():
+            fno.predict_trajectory(seed_window, min(n_rollout, 10))
+        if device == 'cuda':
+            torch.cuda.synchronize()
+
+        n_reps = 5
+        t_start = time.perf_counter()
+        for _ in range(n_reps):
+            with torch.no_grad():
+                fno.predict_trajectory(seed_window, n_rollout)
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        t_end = time.perf_counter()
+
+        total_ms = (t_end - t_start) / n_reps * 1000
+        per_step_ms = total_ms / n_rollout
+        results['fno_inference'][f'rollout_{n_rollout}_total_ms'] = float(total_ms)
+        results['fno_inference'][f'rollout_{n_rollout}_per_step_ms'] = float(per_step_ms)
+        print(f"  FNO {n_rollout}-step rollout: {total_ms:.1f} ms total, "
+              f"{per_step_ms:.3f} ms/step")
+
+    # ── 5. Speedup calculation ───────────────────────────────────────────
+    sim_per_step = results['simulator']['per_step_mean_ms']
+    fno_per_step = results['fno_inference']['single_step_ms']
+    speedup = sim_per_step / fno_per_step if fno_per_step > 0 else float('inf')
+
+    if speedup >= 1.0:
+        speedup_note = (f'FNO is {speedup:.1f}× faster per step than event-driven simulation')
+    else:
+        speedup_note = (
+            f'Event-driven simulation is {1/speedup:.1f}× faster per step than FNO on {device}. '
+            f'For this 1D system the analytical inter-collision dynamics are cheap. '
+            f'The FNO advantage is density prediction beyond the Lyapunov horizon, '
+            f'not raw simulation speed.'
+        )
+
+    results['speedup'] = {
+        'single_step': float(speedup),
+        'note': speedup_note,
+    }
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("COMPUTATIONAL COST SUMMARY")
+    print("=" * 60)
+    print(f"  {'Component':<35} {'Time':>10}")
+    print("  " + "-" * 47)
+    print(f"  {'Simulator (per step)':<35} {sim_per_step:>8.3f} ms")
+    print(f"  {'FNO single-step inference':<35} {fno_per_step:>8.3f} ms")
+    if 'rollout_100_per_step_ms' in results['fno_inference']:
+        print(f"  {'FNO 100-step rollout (per step)':<35} "
+              f"{results['fno_inference']['rollout_100_per_step_ms']:>8.3f} ms")
+    if 'rollout_500_per_step_ms' in results['fno_inference']:
+        print(f"  {'FNO 500-step rollout (per step)':<35} "
+              f"{results['fno_inference']['rollout_500_per_step_ms']:>8.3f} ms")
+    print(f"\n  Speedup: {speedup:.1f}× (single-step)")
+
+    return results
+
+
+# =============================================================================
 # RUN MODES — trajectory / simulation_time budgets per scale
 # =============================================================================
 
@@ -1973,8 +2554,8 @@ def run_all_experiments(
           f"sim_time={config.simulation_time}s")
     print("=" * 70)
 
-    # 10 phases: exps 1–7 + 3b + 7b + save
-    timer = RunTimer(total_experiments=10)
+    # 13 phases: exps 1–7 + 3b + 7b + 8 + 9 + 10 + save
+    timer = RunTimer(total_experiments=13)
     all_results: Dict = {}
 
     # ------------------------------------------------------------------
@@ -2106,6 +2687,39 @@ def run_all_experiments(
         print("  (Ensure experiment_7b_inverse_fno.py is on the Python path.)")
         all_results["experiment_7b_inverse_fno"] = {"error": str(exc)}
     timer.stop("Exp 7b: FNO Inverse Problem (Framing A)", t0)
+
+    # ------------------------------------------------------------------
+    # Experiment 8: Grid convergence study
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("RUNNING EXPERIMENT 8: Grid Convergence Study")
+    print("=" * 70)
+    t0 = timer.start("Exp 8: Grid Convergence")
+    grid_results = experiment_8_grid_convergence(config, dataset)
+    all_results["experiment_8_grid_convergence"] = grid_results
+    timer.stop("Exp 8: Grid Convergence", t0)
+
+    # ------------------------------------------------------------------
+    # Experiment 9: Multi-seed training
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("RUNNING EXPERIMENT 9: Multi-Seed Training")
+    print("=" * 70)
+    t0 = timer.start("Exp 9: Multi-Seed Training")
+    seed_results = experiment_9_multi_seed(config, dataset, n_seeds=3)
+    all_results["experiment_9_multi_seed"] = seed_results
+    timer.stop("Exp 9: Multi-Seed Training", t0)
+
+    # ------------------------------------------------------------------
+    # Experiment 10: Computational cost profiling
+    # ------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("RUNNING EXPERIMENT 10: Computational Cost Profiling")
+    print("=" * 70)
+    t0 = timer.start("Exp 10: Computational Cost")
+    cost_results = experiment_10_computational_cost(config, dataset)
+    all_results["experiment_10_computational_cost"] = cost_results
+    timer.stop("Exp 10: Computational Cost", t0)
 
     # ------------------------------------------------------------------
     # Save everything

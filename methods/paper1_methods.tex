@@ -220,6 +220,14 @@ Activation function & $\sigma$ & GeLU \\
 \label{tab:hyperparams}
 \end{table}
 
+\subsection{Stacked History Input}
+
+A single density snapshot $\rho(\cdot, t)$ is insufficient to determine the future evolution: the coarse-graining (Eq.~6) marginalises over velocities, so the density alone does not uniquely specify the microscopic state. To recover approximate velocity information, we stack $k$ consecutive frames as the FNO input:
+\begin{equation}
+    \rho_{\text{in}}(\cdot, t) = \bigl[\rho(\cdot, t-(k{-}1)\Delta t),\; \ldots,\; \rho(\cdot, t{-}\Delta t),\; \rho(\cdot, t)\bigr] \in \R^{k \times n}
+\end{equation}
+Finite differences between adjacent frames approximate the time derivative $\partial_t \rho$, and second differences approximate $\partial_{tt} \rho$. With $k=4$ frames the network has access to zeroth- through third-order temporal information, sufficient to resolve the velocity and acceleration content lost during marginalisation. All baseline methods (LSTM, U-Net) receive the same $k$-frame input to ensure a fair comparison; only the simple non-learned baselines (persistence, linear extrapolation) operate on single frames.
+
 \subsection{Multi-Step Prediction}
 
 For long-horizon prediction, we apply the learned operator autoregressively:
@@ -383,6 +391,14 @@ Even when pointwise density prediction degrades, the predicted density should ma
 \end{equation}
 between predicted and true trajectories.
 
+\subsection{Grid Convergence}
+
+To verify that the learned operator converges under spatial refinement, we train separate FNO instances at resolutions $n \in \{64, 128, 256, 512\}$ and report both single-step and multi-step (10-step rollout) MSE. The training data is re-binned from the original trajectories via linear interpolation with mass-conserving rescaling. The number of retained Fourier modes is capped at $n/2$ (the Nyquist limit) to ensure a well-posed spectral representation at each resolution.
+
+\subsection{Statistical Confidence}
+
+All reported metrics include uncertainty estimates from $n_{\text{seeds}} = 3$ independent training runs with different random initialisations. We report mean $\pm$ standard deviation for validation loss and multi-step rollout MSE at horizons $\{1, 2, 5, 10\} \times T_{\text{Lyap}}$.
+
 \subsection{Generalization Tests}
 
 We test generalization across:
@@ -412,21 +428,23 @@ Ulam's method discretizes the PF operator by partitioning phase space into cells
 
 \subsection{Recurrent Neural Networks}
 
-We implement an LSTM baseline:
+We implement an LSTM baseline that receives the same $k$-frame stacked input as the FNO:
 \begin{itemize}
-    \item Input: Flattened density field
+    \item Input: $k=4$ consecutive density frames, each treated as one LSTM time step
     \item Hidden dimension: 256
     \item Layers: 2
-    \item Output: Next density field
+    \item Output: Predicted density at the next time step
 \end{itemize}
+The LSTM naturally processes the $k$ frames sequentially, building a hidden state that encodes velocity and acceleration information from the finite-difference structure of the input window.
 
 \subsection{Convolutional Neural Networks}
 
-A U-Net style architecture:
+A 1D U-Net architecture with the $k$-frame history as input channels:
 \begin{itemize}
+    \item Input: $k=4$ density frames treated as $k$ input channels
     \item Encoder: 4 convolutional blocks with downsampling
-    \item Decoder: 4 transposed convolutional blocks
-    \item Skip connections between encoder and decoder
+    \item Decoder: 4 transposed convolutional blocks with skip connections
+    \item Output: 1-channel predicted density at the next time step
 \end{itemize}
 
 %==============================================================================
@@ -439,8 +457,7 @@ The codebase is implemented in:
 \begin{itemize}
     \item \textbf{Physics simulation:} Python with NumPy (event-driven MD)
     \item \textbf{Neural operators:} PyTorch 2.0 with custom FNO layers
-    \item \textbf{Training infrastructure:} PyTorch Lightning
-    \item \textbf{Experiment tracking:} Weights \& Biases
+    \item \textbf{Training:} Custom PyTorch training loops with AdamW, cosine annealing, and early stopping
 \end{itemize}
 
 Code and trained models will be released at: \texttt{github.com/[redacted]/impulsive-neural-operators}
@@ -471,7 +488,7 @@ All random seeds are fixed:
     \item Model initialization: seed $= 0$
 \end{itemize}
 
-Confidence intervals are computed over 5 independent training runs.
+Confidence intervals are computed over 3 independent training runs with different random initialisations.
 
 %==============================================================================
 \section{Extension: Inverse Problem}

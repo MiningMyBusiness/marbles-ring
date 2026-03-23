@@ -28,22 +28,28 @@ from dataclasses import dataclass
 class LSTMDensityPredictor(nn.Module):
     """
     LSTM baseline for density field prediction.
-    
+
     Architecture:
-    - Input: Flattened density field
+    - Input: k_history consecutive density frames, shape (batch, k_history, n_bins)
     - LSTM: 2 layers, hidden dimension 256
-    - Output: Next density field
-    
-    This baseline treats density evolution as a sequence prediction problem.
+    - Output: Next density field, shape (batch, n_bins)
+
+    Accepting a window of k_history frames gives the LSTM the same temporal
+    context (finite-difference velocity/acceleration) as the FNO, ensuring a
+    fair comparison.  If a single-frame (batch, n_bins) tensor is supplied the
+    model automatically unsqueezes it to (batch, 1, n_bins) for backward
+    compatibility.
     """
-    
-    def __init__(self, n_bins: int = 128, hidden_dim: int = 256, n_layers: int = 2):
+
+    def __init__(self, n_bins: int = 128, hidden_dim: int = 256, n_layers: int = 2,
+                 k_history: int = 4):
         super(LSTMDensityPredictor, self).__init__()
-        
+
         self.n_bins = n_bins
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
-        
+        self.k_history = k_history
+
         self.lstm = nn.LSTM(
             input_size=n_bins,
             hidden_size=hidden_dim,
@@ -51,63 +57,69 @@ class LSTMDensityPredictor(nn.Module):
             batch_first=True,
             dropout=0.1 if n_layers > 1 else 0.0
         )
-        
+
         self.fc = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, n_bins)
         )
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass.
-        
+
         Args:
-            x: Input density, shape (batch, n_bins)
-            
+            x: Input density window.
+               Shape (batch, k_history, n_bins) — preferred, or
+               Shape (batch, n_bins) — single-frame fallback.
+
         Returns:
             Predicted density, shape (batch, n_bins)
         """
-        # Add sequence dimension: (batch, n_bins) -> (batch, 1, n_bins)
-        x = x.unsqueeze(1)
-        
-        # LSTM forward
+        if x.dim() == 2:
+            # Single-frame input: (batch, n_bins) -> (batch, 1, n_bins)
+            x = x.unsqueeze(1)
+
+        # x is now (batch, seq_len, n_bins) where seq_len = k_history
         out, _ = self.lstm(x)
-        
+
         # Take last timestep output
         out = out[:, -1, :]  # (batch, hidden_dim)
-        
+
         # Fully connected layers
         out = self.fc(out)
-        
+
         # Ensure non-negative density
         out = F.relu(out)
-        
+
         return out
-    
-    def predict_trajectory(self, initial_density: torch.Tensor, n_steps: int) -> torch.Tensor:
+
+    def predict_trajectory(self, seed_window: torch.Tensor, n_steps: int) -> torch.Tensor:
         """
-        Autoregressively predict trajectory.
-        
+        Autoregressively predict trajectory from a seed window.
+
         Args:
-            initial_density: Starting density, shape (n_bins,) or (1, n_bins)
+            seed_window: Starting window, shape (k_history, n_bins) or (1, k_history, n_bins)
             n_steps: Number of steps to predict
-            
+
         Returns:
-            Trajectory, shape (n_steps + 1, n_bins)
+            Trajectory, shape (n_steps + 1, n_bins) starting from the last
+            frame of the seed window.
         """
-        if initial_density.dim() == 1:
-            initial_density = initial_density.unsqueeze(0)
-        
-        trajectory = [initial_density]
-        rho = initial_density
-        
+        if seed_window.dim() == 2:
+            seed_window = seed_window.unsqueeze(0)  # (1, k, n_bins)
+
+        window = seed_window.clone()          # (1, k, n_bins)
+        trajectory = [window[:, -1, :]]       # start with last seed frame
+
         with torch.no_grad():
             for _ in range(n_steps):
-                rho = self.forward(rho)
-                trajectory.append(rho)
-        
-        return torch.cat(trajectory, dim=0)
+                rho_next = self.forward(window)       # (1, n_bins)
+                trajectory.append(rho_next)
+                # Slide the window: drop oldest, append new prediction
+                window = torch.cat([window[:, 1:, :], rho_next.unsqueeze(1)], dim=1)
+
+        return torch.cat(trajectory, dim=0)   # (n_steps+1, n_bins)
 
 
 # =============================================================================
@@ -117,48 +129,53 @@ class LSTMDensityPredictor(nn.Module):
 class UNet1D(nn.Module):
     """
     1D U-Net for density field prediction.
-    
+
     Architecture:
     - Encoder: 4 convolutional blocks with downsampling
     - Decoder: 4 transposed convolutional blocks
     - Skip connections between encoder and decoder
-    
-    This baseline captures spatial structure in the density field.
+
+    Input may be a single frame (batch, n_bins) or a stacked window
+    (batch, k_history, n_bins).  When k_history > 1 the frames are
+    treated as separate input channels, giving the U-Net the same
+    finite-difference velocity information available to the FNO.
     """
-    
-    def __init__(self, n_bins: int = 128, base_channels: int = 32):
+
+    def __init__(self, n_bins: int = 128, base_channels: int = 32,
+                 in_channels: int = 1):
         super(UNet1D, self).__init__()
-        
+
         self.n_bins = n_bins
-        
+        self.in_channels = in_channels  # 1 for single-frame, k_history for windowed
+
         # Encoder (downsampling path)
-        self.enc1 = self._conv_block(1, base_channels)
+        self.enc1 = self._conv_block(in_channels, base_channels)
         self.enc2 = self._conv_block(base_channels, base_channels * 2)
         self.enc3 = self._conv_block(base_channels * 2, base_channels * 4)
         self.enc4 = self._conv_block(base_channels * 4, base_channels * 8)
-        
+
         self.pool = nn.MaxPool1d(2)
-        
+
         # Bottleneck
         self.bottleneck = self._conv_block(base_channels * 8, base_channels * 16)
-        
+
         # Decoder (upsampling path)
-        self.upconv4 = nn.ConvTranspose1d(base_channels * 16, base_channels * 8, 
+        self.upconv4 = nn.ConvTranspose1d(base_channels * 16, base_channels * 8,
                                            kernel_size=2, stride=2)
         self.dec4 = self._conv_block(base_channels * 16, base_channels * 8)  # *16 from skip
-        
-        self.upconv3 = nn.ConvTranspose1d(base_channels * 8, base_channels * 4, 
+
+        self.upconv3 = nn.ConvTranspose1d(base_channels * 8, base_channels * 4,
                                            kernel_size=2, stride=2)
         self.dec3 = self._conv_block(base_channels * 8, base_channels * 4)
-        
-        self.upconv2 = nn.ConvTranspose1d(base_channels * 4, base_channels * 2, 
+
+        self.upconv2 = nn.ConvTranspose1d(base_channels * 4, base_channels * 2,
                                            kernel_size=2, stride=2)
         self.dec2 = self._conv_block(base_channels * 4, base_channels * 2)
-        
-        self.upconv1 = nn.ConvTranspose1d(base_channels * 2, base_channels, 
+
+        self.upconv1 = nn.ConvTranspose1d(base_channels * 2, base_channels,
                                            kernel_size=2, stride=2)
         self.dec1 = self._conv_block(base_channels * 2, base_channels)
-        
+
         # Final output layer
         self.out = nn.Conv1d(base_channels, 1, kernel_size=1)
     
@@ -176,16 +193,20 @@ class UNet1D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass.
-        
+
         Args:
-            x: Input density, shape (batch, n_bins)
-            
+            x: Input density.
+               Shape (batch, k_history, n_bins) — windowed input (k_history channels), or
+               Shape (batch, n_bins)            — single-frame fallback.
+
         Returns:
             Predicted density, shape (batch, n_bins)
         """
-        # Add channel dimension: (batch, n_bins) -> (batch, 1, n_bins)
-        x = x.unsqueeze(1)
-        
+        if x.dim() == 2:
+            # Single-frame input: (batch, n_bins) -> (batch, 1, n_bins)
+            x = x.unsqueeze(1)
+        # else: already (batch, k_history, n_bins), treat k_history as channels
+
         # Encoder
         enc1 = self.enc1(x)
         x = self.pool(enc1)
@@ -228,20 +249,37 @@ class UNet1D(nn.Module):
         
         return x
     
-    def predict_trajectory(self, initial_density: torch.Tensor, n_steps: int) -> torch.Tensor:
-        """Autoregressively predict trajectory."""
-        if initial_density.dim() == 1:
-            initial_density = initial_density.unsqueeze(0)
-        
-        trajectory = [initial_density]
-        rho = initial_density
-        
+    def predict_trajectory(self, seed_window: torch.Tensor, n_steps: int) -> torch.Tensor:
+        """
+        Autoregressively predict trajectory from a seed window.
+
+        Args:
+            seed_window: Starting window, shape (k, n_bins) or (1, k, n_bins),
+                         or a single frame (n_bins,) / (1, n_bins).
+            n_steps: Number of steps to predict
+
+        Returns:
+            Trajectory, shape (n_steps + 1, n_bins)
+        """
+        if seed_window.dim() == 1:
+            seed_window = seed_window.unsqueeze(0).unsqueeze(0)  # (1,1,n)
+        elif seed_window.dim() == 2:
+            if seed_window.shape[0] == 1:
+                seed_window = seed_window.unsqueeze(0)           # single-frame batch
+            else:
+                seed_window = seed_window.unsqueeze(0)           # (1,k,n)
+
+        window = seed_window.clone()          # (1, k, n_bins)
+        trajectory = [window[:, -1, :]]       # start with last seed frame
+
         with torch.no_grad():
             for _ in range(n_steps):
-                rho = self.forward(rho)
-                trajectory.append(rho)
-        
-        return torch.cat(trajectory, dim=0)
+                rho_next = self.forward(window)       # (1, n_bins)
+                trajectory.append(rho_next)
+                # Slide the window: drop oldest, append new prediction
+                window = torch.cat([window[:, 1:, :], rho_next.unsqueeze(1)], dim=1)
+
+        return torch.cat(trajectory, dim=0)   # (n_steps+1, n_bins)
 
 
 # =============================================================================
