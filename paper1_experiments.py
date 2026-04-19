@@ -597,13 +597,33 @@ def experiment_3_fno_training(
     
     train_trajectories = convert_to_trajectories(dataset['train'])
     val_trajectories = convert_to_trajectories(dataset['val'])
-    
+
+    # Filter out trajectories that are too short to form even one training sample.
+    # Minimum required: k_history (input frames) + n_steps_ahead (target frame).
+    min_timesteps = config.k_history + 1
+    def _filter_trajectories(trajs, split_name):
+        valid = [t for t in trajs if t.n_timesteps >= min_timesteps]
+        n_dropped = len(trajs) - len(valid)
+        if n_dropped:
+            print(f"  WARNING: dropped {n_dropped}/{len(trajs)} {split_name} trajectories "
+                  f"with fewer than {min_timesteps} timesteps")
+        return valid
+
+    train_trajectories = _filter_trajectories(train_trajectories, 'train')
+    val_trajectories   = _filter_trajectories(val_trajectories,   'val')
+
+    if not train_trajectories:
+        raise RuntimeError(
+            f"All training trajectories were filtered out (min required timesteps: "
+            f"{min_timesteps}). Increase simulation_time or reduce k_history."
+        )
+
     # Create PyTorch datasets (stacked k-frame history windows)
     train_dataset = DensityDataset(train_trajectories, n_steps_ahead=1, normalize=True,
                                    k_history=config.k_history)
     val_dataset   = DensityDataset(val_trajectories,   n_steps_ahead=1, normalize=True,
                                    k_history=config.k_history)
-    
+
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
@@ -617,9 +637,10 @@ def experiment_3_fno_training(
         shuffle=False,
         num_workers=0
     )
-    
+
     print(f"  Training samples: {len(train_dataset)}")
     print(f"  Validation samples: {len(val_dataset)}")
+
     
     # Main training run
     print("\nTraining FNO with default hyperparameters...")
@@ -2513,14 +2534,29 @@ def _fmt(seconds: float) -> str:
 def run_all_experiments(
     config: Optional[ExperimentConfig] = None,
     smoke_test: bool = False,
+    load_dataset: Optional[str] = None,
+    load_fno: Optional[str] = None,
+    start_from: int = 1,
 ) -> Tuple[Dict, str]:
     """
     Orchestrate all Paper 1 experiments and save results to disk.
 
     Parameters
     ----------
-    config     : Pre-built ExperimentConfig; if None one is constructed.
-    smoke_test : If True, forward smoke-test flag to Experiment 7b.
+    config       : Pre-built ExperimentConfig; if None one is constructed.
+    smoke_test   : If True, forward smoke-test flag to Experiment 7b.
+    load_dataset : Path to an existing ``dataset.json`` from a previous run.
+                   When provided Experiment 1 is skipped and the dataset is
+                   loaded from this file.
+    load_fno     : Path to an existing FNO checkpoint (``.pt``) from a
+                   previous run.  When provided Experiments 3 and 3b are
+                   skipped and the model is loaded from this file.
+                   ``start_from`` must be >= 3 when this is set.
+    start_from   : Skip all experiments whose number is less than this value.
+                   Prerequisites that are skipped must be supplied via
+                   ``load_dataset`` / ``load_fno`` as appropriate.
+                   Valid values: 1 (default, run everything), 2, 3, 3 (after
+                   passing load_fno), 4, 5, 6, 7, 8, 9, 10.
 
     Returns
     -------
@@ -2536,6 +2572,18 @@ def run_all_experiments(
             simulation_time=200.0,
         )
 
+    # ── Validate resume arguments ──────────────────────────────────────────
+    if load_dataset and not os.path.isfile(load_dataset):
+        raise FileNotFoundError(f"--load-dataset: file not found: {load_dataset}")
+    if load_fno and not os.path.isfile(load_fno):
+        raise FileNotFoundError(f"--load-fno: file not found: {load_fno}")
+    if load_dataset and start_from < 2:
+        # Dataset is being loaded, so Exp 1 is implicitly skipped.
+        start_from = max(start_from, 2)
+    if load_fno and start_from < 4:
+        # FNO checkpoint supplied — Exps 3 & 3b are implicitly skipped.
+        start_from = max(start_from, 4)
+
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2548,178 +2596,296 @@ def run_all_experiments(
     print(f"PAPER 1 EXPERIMENTS  —  {config.experiment_name}")
     print(f"Run dir : {run_dir}")
     print(f"Device  : {'cuda' if torch.cuda.is_available() else 'cpu'}")
-    print(f"Dataset : train={config.n_training_trajectories}  "
-          f"val={config.n_validation_trajectories}  "
-          f"test={config.n_test_trajectories}  "
-          f"sim_time={config.simulation_time}s")
+    if start_from > 1:
+        print(f"Resuming from Experiment {start_from}  (skipping 1–{start_from - 1})")
+    if load_dataset:
+        print(f"Dataset  : loaded from {load_dataset}")
+    else:
+        print(f"Dataset : train={config.n_training_trajectories}  "
+              f"val={config.n_validation_trajectories}  "
+              f"test={config.n_test_trajectories}  "
+              f"sim_time={config.simulation_time}s")
+    if load_fno:
+        print(f"FNO ckpt : loaded from {load_fno}")
     print("=" * 70)
 
     # 13 phases: exps 1–7 + 3b + 7b + 8 + 9 + 10 + save
     timer = RunTimer(total_experiments=13)
     all_results: Dict = {}
 
+    # ── Initialise shared prerequisites ────────────────────────────────────
+    # These variables are populated either by running the experiment or by
+    # loading from disk.  Later experiments reference them directly.
+    dataset:       Optional[Dict]                    = None
+    fno:           Optional[FourierNeuralOperator]   = None
+    fno_finetuned: Optional[FourierNeuralOperator]   = None
+    train_dataset: Optional[DensityDataset]          = None
+
     # ------------------------------------------------------------------
     # Experiment 1: Dataset generation
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 1: Dataset Generation")
-    print("=" * 70)
-    t0 = timer.start("Exp 1: Dataset Generation")
-    dataset = experiment_1_generate_dataset(config)
-    all_results["experiment_1_dataset"] = dataset["statistics"]
-    timer.stop("Exp 1: Dataset Generation", t0)
+    if start_from <= 1:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 1: Dataset Generation")
+        print("=" * 70)
+        t0 = timer.start("Exp 1: Dataset Generation")
+        dataset = experiment_1_generate_dataset(config)
+        all_results["experiment_1_dataset"] = dataset["statistics"]
+        timer.stop("Exp 1: Dataset Generation", t0)
 
-    with open(os.path.join(run_dir, "dataset.json"), "w") as f:
-        json.dump(dataset, f, default=_json_safe)
-    print(f"  Dataset saved to {run_dir}/dataset.json")
+        with open(os.path.join(run_dir, "dataset.json"), "w") as f:
+            json.dump(dataset, f, default=_json_safe)
+        print(f"  Dataset saved to {run_dir}/dataset.json")
+    else:
+        # Load pre-existing dataset
+        _ds_path = load_dataset
+        if _ds_path is None:
+            raise ValueError(
+                "--start-from >= 2 requires --load-dataset <path/to/dataset.json>"
+            )
+        print(f"\n  [SKIP Exp 1] Loading dataset from {_ds_path} ...")
+        with open(_ds_path) as _f:
+            dataset = json.load(_f)
+        all_results["experiment_1_dataset"] = dataset.get("statistics", {})
+        print(f"  Dataset loaded  (train={len(dataset['train'])}  "
+              f"val={len(dataset['val'])}  test={len(dataset['test'])})")
 
     # ------------------------------------------------------------------
     # Experiment 2: Lyapunov characterisation
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 2: Lyapunov Characterisation")
-    print("=" * 70)
-    t0 = timer.start("Exp 2: Lyapunov Characterisation")
-    lyapunov_results = experiment_2_lyapunov_characterization(config)
-    all_results["experiment_2_lyapunov"] = lyapunov_results
-    timer.stop("Exp 2: Lyapunov Characterisation", t0)
+    if start_from <= 2:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 2: Lyapunov Characterisation")
+        print("=" * 70)
+        t0 = timer.start("Exp 2: Lyapunov Characterisation")
+        lyapunov_results = experiment_2_lyapunov_characterization(config)
+        all_results["experiment_2_lyapunov"] = lyapunov_results
+        timer.stop("Exp 2: Lyapunov Characterisation", t0)
+    else:
+        print("  [SKIP Exp 2] Lyapunov characterisation")
 
     # ------------------------------------------------------------------
     # Experiment 3: FNO training
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 3: FNO Training")
-    print("=" * 70)
-    t0 = timer.start("Exp 3: FNO Training")
-    training_results, fno, train_dataset = experiment_3_fno_training(config, dataset)
-    all_results["experiment_3_training"] = training_results
-    timer.stop("Exp 3: FNO Training", t0)
+    if start_from <= 3 and load_fno is None:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 3: FNO Training")
+        print("=" * 70)
+        t0 = timer.start("Exp 3: FNO Training")
+        training_results, fno, train_dataset = experiment_3_fno_training(config, dataset)
+        all_results["experiment_3_training"] = training_results
+        timer.stop("Exp 3: FNO Training", t0)
 
-    model_path = os.path.join(run_dir, "fno_checkpoint.pt")
-    save_model(fno, model_path, metadata={"config": asdict(config)})
-    print(f"  FNO checkpoint saved to {model_path}")
+        model_path = os.path.join(run_dir, "fno_checkpoint.pt")
+        save_model(fno, model_path, metadata={"config": asdict(config)})
+        print(f"  FNO checkpoint saved to {model_path}")
+    elif load_fno is None:
+        print("  [SKIP Exp 3] FNO training")
+    else:
+        # Load FNO from supplied checkpoint and reconstruct train_dataset
+        print(f"\n  [SKIP Exp 3] Loading FNO from {load_fno} ...")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        fno = FourierNeuralOperator(
+            n_bins=config.n_density_bins,
+            n_modes=config.fno_modes,
+            hidden_channels=config.fno_hidden_channels,
+            n_layers=config.fno_layers,
+            delta_t=config.save_interval,
+            k_history=config.k_history,
+            lstm_hidden=config.lstm_hidden,
+            lstm_layers=config.lstm_layers,
+        )
+        _ckpt = torch.load(load_fno, map_location=device)
+        _state = _ckpt.get("model_state_dict", _ckpt)
+        fno.load_state_dict(_state)
+        fno = fno.to(device)
+        print("  FNO loaded.")
+
+        # Rebuild train_dataset (needed for normalisation stats)
+        def _to_dt(traj_list):
+            return [
+                DensityTrajectory(
+                    time_points=np.array(t["time_points"]),
+                    density_fields=np.array(t["density_fields"]),
+                    delta_t=config.save_interval,
+                    system_params={"n_particles": t["n_particles"]},
+                )
+                for t in traj_list
+                if len(t["time_points"]) >= config.k_history + 1
+            ]
+        train_dataset = DensityDataset(
+            _to_dt(dataset["train"]), n_steps_ahead=1, normalize=True,
+            k_history=config.k_history,
+        )
+        print("  train_dataset reconstructed from loaded dataset.")
+        all_results["experiment_3_training"] = {"note": f"loaded from {load_fno}"}
 
     # ------------------------------------------------------------------
     # Experiment 3b: Curriculum fine-tuning
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 3b: Curriculum Fine-Tuning (Scheduled Sampling)")
-    print("=" * 70)
-    t0 = timer.start("Exp 3b: Curriculum Fine-Tuning")
-    finetuning_results, fno_finetuned = experiment_3b_fno_curriculum_finetuning(
-        config, fno, dataset, train_dataset
-    )
-    all_results["experiment_3b_curriculum"] = finetuning_results
-    timer.stop("Exp 3b: Curriculum Fine-Tuning", t0)
+    if start_from <= 3 and load_fno is None:
+        # Only run 3b when we just trained Exp 3 from scratch
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 3b: Curriculum Fine-Tuning (Scheduled Sampling)")
+        print("=" * 70)
+        t0 = timer.start("Exp 3b: Curriculum Fine-Tuning")
+        finetuning_results, fno_finetuned = experiment_3b_fno_curriculum_finetuning(
+            config, fno, dataset, train_dataset
+        )
+        all_results["experiment_3b_curriculum"] = finetuning_results
+        timer.stop("Exp 3b: Curriculum Fine-Tuning", t0)
 
-    finetuned_path = os.path.join(run_dir, "fno_finetuned_checkpoint.pt")
-    save_model(fno_finetuned, finetuned_path, metadata={"config": asdict(config)})
-    print(f"  Fine-tuned FNO checkpoint saved to {finetuned_path}")
+        finetuned_path = os.path.join(run_dir, "fno_finetuned_checkpoint.pt")
+        save_model(fno_finetuned, finetuned_path, metadata={"config": asdict(config)})
+        print(f"  Fine-tuned FNO checkpoint saved to {finetuned_path}")
+    elif load_fno is not None:
+        # The supplied checkpoint is treated as already fine-tuned
+        fno_finetuned = fno
+        all_results["experiment_3b_curriculum"] = {"note": f"loaded from {load_fno}"}
+        print("  [SKIP Exp 3b] Using supplied --load-fno checkpoint as fine-tuned model")
+    else:
+        # start_from > 3 but no checkpoint supplied: cannot safely run Exp 4
+        fno_finetuned = fno  # fno is None here; Exp 4 will fail with a clear error
+        print("  [SKIP Exp 3b] Curriculum fine-tuning")
 
     # ------------------------------------------------------------------
     # Experiment 4: Lyapunov bypass  (uses curriculum-fine-tuned model)
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 4: Lyapunov Horizon Bypass")
-    print("=" * 70)
-    t0 = timer.start("Exp 4: Lyapunov Bypass")
-    bypass_results = experiment_4_lyapunov_bypass(config, fno_finetuned, dataset, train_dataset)
-    all_results["experiment_4_bypass"] = bypass_results
-    timer.stop("Exp 4: Lyapunov Bypass", t0)
+    if start_from <= 4:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 4: Lyapunov Horizon Bypass")
+        print("=" * 70)
+        if fno_finetuned is None:
+            raise RuntimeError(
+                "Experiment 4 requires a trained FNO. "
+                "Either run from Exp 3 or supply --load-fno <checkpoint>."
+            )
+        t0 = timer.start("Exp 4: Lyapunov Bypass")
+        bypass_results = experiment_4_lyapunov_bypass(config, fno_finetuned, dataset, train_dataset)
+        all_results["experiment_4_bypass"] = bypass_results
+        timer.stop("Exp 4: Lyapunov Bypass", t0)
+    else:
+        print("  [SKIP Exp 4] Lyapunov horizon bypass")
 
     # ------------------------------------------------------------------
     # Experiment 5: Ablations
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 5: Ablation Studies")
-    print("=" * 70)
-    t0 = timer.start("Exp 5: Ablation Studies")
-    ablation_results = experiment_5_ablations(config, dataset, train_dataset)
-    all_results["experiment_5_ablations"] = ablation_results
-    timer.stop("Exp 5: Ablation Studies", t0)
+    if start_from <= 5:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 5: Ablation Studies")
+        print("=" * 70)
+        if train_dataset is None:
+            raise RuntimeError(
+                "Experiment 5 requires train_dataset. "
+                "Either run from Exp 3 or supply --load-fno <checkpoint>."
+            )
+        t0 = timer.start("Exp 5: Ablation Studies")
+        ablation_results = experiment_5_ablations(config, dataset, train_dataset)
+        all_results["experiment_5_ablations"] = ablation_results
+        timer.stop("Exp 5: Ablation Studies", t0)
+    else:
+        print("  [SKIP Exp 5] Ablation studies")
 
     # ------------------------------------------------------------------
     # Experiment 6: Baselines
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 6: Baseline Comparisons")
-    print("=" * 70)
-    t0 = timer.start("Exp 6: Baseline Comparisons")
-    baseline_results = experiment_6_baselines(config, dataset)
-    all_results["experiment_6_baselines"] = baseline_results
-    timer.stop("Exp 6: Baseline Comparisons", t0)
+    if start_from <= 6:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 6: Baseline Comparisons")
+        print("=" * 70)
+        t0 = timer.start("Exp 6: Baseline Comparisons")
+        baseline_results = experiment_6_baselines(config, dataset)
+        all_results["experiment_6_baselines"] = baseline_results
+        timer.stop("Exp 6: Baseline Comparisons", t0)
+    else:
+        print("  [SKIP Exp 6] Baseline comparisons")
 
     # ------------------------------------------------------------------
     # Experiment 7: Inverse problem (collision-graph, Framing B)
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 7: Inverse Problem (Framing B — collision encoder)")
-    print("=" * 70)
-    t0 = timer.start("Exp 7: Inverse Problem (Framing B)")
-    inverse_results = experiment_7_inverse_problem(config, dataset)
-    all_results["experiment_7_inverse"] = inverse_results
-    timer.stop("Exp 7: Inverse Problem (Framing B)", t0)
+    if start_from <= 7:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 7: Inverse Problem (Framing B — collision encoder)")
+        print("=" * 70)
+        t0 = timer.start("Exp 7: Inverse Problem (Framing B)")
+        inverse_results = experiment_7_inverse_problem(config, dataset)
+        all_results["experiment_7_inverse"] = inverse_results
+        timer.stop("Exp 7: Inverse Problem (Framing B)", t0)
+    else:
+        print("  [SKIP Exp 7] Inverse problem (Framing B)")
 
     # ------------------------------------------------------------------
     # Experiment 7b: FNO-in-the-loop inverse problem (Framing A)
     # Requires fno_checkpoint.pt written by Exp 3 to be found in output_dir.
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 7b: FNO-In-The-Loop Inverse Problem (Framing A)")
-    print("=" * 70)
-    t0 = timer.start("Exp 7b: FNO Inverse Problem (Framing A)")
-    try:
-        # The checkpoint is saved to run_dir; patch output_dir so that
-        # experiment_7b can find it via cfg.output_dir / cfg.checkpoint_name.
-        exp7b_config = ExperimentConfig(
-            **{**asdict(config),
-               "output_dir": run_dir,
-               "experiment_name": config.experiment_name + "_7b"})
-        from experiment_7b_inverse_fno import experiment_7b_inverse_fno as _exp7b
-        inverse_fno_results = _exp7b(
-            config=exp7b_config,
-            dataset=dataset,
-            smoke_test=smoke_test,
-        )
-        all_results["experiment_7b_inverse_fno"] = inverse_fno_results
-    except Exception as exc:
-        print(f"  WARNING: Experiment 7b failed with: {exc}")
-        print("  (Ensure experiment_7b_inverse_fno.py is on the Python path.)")
-        all_results["experiment_7b_inverse_fno"] = {"error": str(exc)}
-    timer.stop("Exp 7b: FNO Inverse Problem (Framing A)", t0)
+    if start_from <= 7:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 7b: FNO-In-The-Loop Inverse Problem (Framing A)")
+        print("=" * 70)
+        t0 = timer.start("Exp 7b: FNO Inverse Problem (Framing A)")
+        try:
+            # The checkpoint is saved to run_dir; patch output_dir so that
+            # experiment_7b can find it via cfg.output_dir / cfg.checkpoint_name.
+            exp7b_config = ExperimentConfig(
+                **{**asdict(config),
+                   "output_dir": run_dir,
+                   "experiment_name": config.experiment_name + "_7b"})
+            from experiment_7b_inverse_fno import experiment_7b_inverse_fno as _exp7b
+            inverse_fno_results = _exp7b(
+                config=exp7b_config,
+                dataset=dataset,
+                smoke_test=smoke_test,
+            )
+            all_results["experiment_7b_inverse_fno"] = inverse_fno_results
+        except Exception as exc:
+            print(f"  WARNING: Experiment 7b failed with: {exc}")
+            print("  (Ensure experiment_7b_inverse_fno.py is on the Python path.)")
+            all_results["experiment_7b_inverse_fno"] = {"error": str(exc)}
+        timer.stop("Exp 7b: FNO Inverse Problem (Framing A)", t0)
+    else:
+        print("  [SKIP Exp 7b] FNO inverse problem (Framing A)")
 
     # ------------------------------------------------------------------
     # Experiment 8: Grid convergence study
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 8: Grid Convergence Study")
-    print("=" * 70)
-    t0 = timer.start("Exp 8: Grid Convergence")
-    grid_results = experiment_8_grid_convergence(config, dataset)
-    all_results["experiment_8_grid_convergence"] = grid_results
-    timer.stop("Exp 8: Grid Convergence", t0)
+    if start_from <= 8:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 8: Grid Convergence Study")
+        print("=" * 70)
+        t0 = timer.start("Exp 8: Grid Convergence")
+        grid_results = experiment_8_grid_convergence(config, dataset)
+        all_results["experiment_8_grid_convergence"] = grid_results
+        timer.stop("Exp 8: Grid Convergence", t0)
+    else:
+        print("  [SKIP Exp 8] Grid convergence study")
 
     # ------------------------------------------------------------------
     # Experiment 9: Multi-seed training
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 9: Multi-Seed Training")
-    print("=" * 70)
-    t0 = timer.start("Exp 9: Multi-Seed Training")
-    seed_results = experiment_9_multi_seed(config, dataset, n_seeds=3)
-    all_results["experiment_9_multi_seed"] = seed_results
-    timer.stop("Exp 9: Multi-Seed Training", t0)
+    if start_from <= 9:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 9: Multi-Seed Training")
+        print("=" * 70)
+        t0 = timer.start("Exp 9: Multi-Seed Training")
+        seed_results = experiment_9_multi_seed(config, dataset, n_seeds=3)
+        all_results["experiment_9_multi_seed"] = seed_results
+        timer.stop("Exp 9: Multi-Seed Training", t0)
+    else:
+        print("  [SKIP Exp 9] Multi-seed training")
 
     # ------------------------------------------------------------------
     # Experiment 10: Computational cost profiling
     # ------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("RUNNING EXPERIMENT 10: Computational Cost Profiling")
-    print("=" * 70)
-    t0 = timer.start("Exp 10: Computational Cost")
-    cost_results = experiment_10_computational_cost(config, dataset)
-    all_results["experiment_10_computational_cost"] = cost_results
-    timer.stop("Exp 10: Computational Cost", t0)
+    if start_from <= 10:
+        print("\n" + "=" * 70)
+        print("RUNNING EXPERIMENT 10: Computational Cost Profiling")
+        print("=" * 70)
+        t0 = timer.start("Exp 10: Computational Cost")
+        cost_results = experiment_10_computational_cost(config, dataset)
+        all_results["experiment_10_computational_cost"] = cost_results
+        timer.stop("Exp 10: Computational Cost", t0)
+    else:
+        print("  [SKIP Exp 10] Computational cost profiling")
 
     # ------------------------------------------------------------------
     # Save everything
@@ -2772,6 +2938,16 @@ Run modes (--mode):
   intermediate 200 train / 40 val / 40 test / 200 s  — ~1-2 h
   full        1000 train /100 val /100 test / 500 s  — ~8-24 h   (paper spec)
   extended    3000 train /300 val /300 test / 500 s  — for statistical robustness
+
+Resume examples:
+  # Skip data generation, resume from Exp 3 (FNO training):
+  python paper1_experiments.py --load-dataset results/paper1/run_XYZ/dataset.json --start-from 3
+
+  # Skip everything through Exp 3b, resume from Exp 4 using existing FNO checkpoint:
+  python paper1_experiments.py \\
+      --load-dataset results/paper1/run_XYZ/dataset.json \\
+      --load-fno    results/paper1/run_XYZ/fno_finetuned_checkpoint.pt \\
+      --start-from  4
 """,
     )
     parser.add_argument(
@@ -2788,6 +2964,32 @@ Run modes (--mode):
                         help="Override experiment name (default: paper1_<mode>)")
     parser.add_argument("--smoke-test-7b", action="store_true",
                         help="Run Experiment 7b in smoke-test mode (saves time)")
+    parser.add_argument(
+        "--load-dataset",
+        default=None,
+        metavar="PATH",
+        help="Path to an existing dataset.json from a previous run. "
+             "Skips Experiment 1 (dataset generation). "
+             "Required when --start-from >= 2.",
+    )
+    parser.add_argument(
+        "--load-fno",
+        default=None,
+        metavar="PATH",
+        help="Path to an existing FNO checkpoint (.pt) from a previous run. "
+             "Skips Experiments 3 and 3b. The supplied checkpoint is used as "
+             "the fine-tuned model for Experiment 4 onwards. "
+             "Requires --load-dataset to also be set.",
+    )
+    parser.add_argument(
+        "--start-from",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Skip all experiments whose number is less than N (default: 1, "
+             "i.e. run everything). Use together with --load-dataset / "
+             "--load-fno to supply the prerequisites for skipped experiments.",
+    )
     args = parser.parse_args()
 
     n_train, n_val, n_test, sim_time = RUN_MODE_PRESETS[args.mode]
@@ -2796,6 +2998,12 @@ Run modes (--mode):
     print(f"\nRun mode : {args.mode}")
     print(f"  train={n_train}  val={n_val}  test={n_test}  sim_time={sim_time}s")
     print(f"  output_dir={args.output_dir}  seed={args.seed}")
+    if args.start_from > 1:
+        print(f"  Resuming from experiment {args.start_from}")
+    if args.load_dataset:
+        print(f"  load_dataset={args.load_dataset}")
+    if args.load_fno:
+        print(f"  load_fno={args.load_fno}")
 
     config = ExperimentConfig(
         experiment_name=exp_name,
@@ -2811,6 +3019,9 @@ Run modes (--mode):
     results, output_dir = run_all_experiments(
         config,
         smoke_test=args.smoke_test_7b,
+        load_dataset=args.load_dataset,
+        load_fno=args.load_fno,
+        start_from=args.start_from,
     )
     print(f"\nAll done. Results in: {output_dir}")
 
