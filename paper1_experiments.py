@@ -107,6 +107,9 @@ class ExperimentConfig:
     lstm_hidden: int = 64   # Hidden dim of the LSTM appended after FNO trunk
     lstm_layers: int = 1    # Number of stacked LSTM layers
 
+    # Training batch size — reduce if hitting OOM on GPU
+    fno_batch_size: int = 32
+
     # Auxiliary loss terms (Methods lines 307-312)
     use_mass_conservation: bool = False  # Enable mass conservation loss
     use_positivity: bool = False  # Enable positivity constraint loss
@@ -627,13 +630,13 @@ def experiment_3_fno_training(
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=64,
+        batch_size=config.fno_batch_size,
         shuffle=True,
         num_workers=0  # Set to 0 for compatibility, increase for speed
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=64,
+        batch_size=config.fno_batch_size,
         shuffle=False,
         num_workers=0
     )
@@ -806,7 +809,7 @@ def experiment_3b_fno_curriculum_finetuning(
     EPOCHS_PER_ROUND   = 20       # Fine-tuning epochs per round
     P_GT_START         = 1.0      # Teacher-forcing prob at round 0
     P_GT_END           = 0.5      # Teacher-forcing prob at round N_ROUNDS-1
-    BATCH_SIZE         = 64
+    BATCH_SIZE         = config.fno_batch_size
     LEARNING_RATE      = 3e-4     # Lower LR for fine-tuning
     SCHED_PATIENCE     = 5
     ES_PATIENCE        = 10
@@ -1282,7 +1285,7 @@ def experiment_5_ablations(config: ExperimentConfig, dataset: Dict, train_datase
     # -------------------------------------------------------------------------
     train_loader_abl = DataLoader(
         train_dataset,
-        batch_size=64,
+        batch_size=config.fno_batch_size,
         shuffle=True,
         num_workers=0
     )
@@ -1304,7 +1307,7 @@ def experiment_5_ablations(config: ExperimentConfig, dataset: Dict, train_datase
     val_dataset_abl.input_std   = train_dataset.input_std
     val_dataset_abl.target_mean = train_dataset.target_mean
     val_dataset_abl.target_std  = train_dataset.target_std
-    val_loader_abl = DataLoader(val_dataset_abl, batch_size=64, shuffle=False, num_workers=0)
+    val_loader_abl = DataLoader(val_dataset_abl, batch_size=config.fno_batch_size, shuffle=False, num_workers=0)
     
     # Default ablation values must match ExperimentConfig (n_modes=32, hidden_channels=64, n_layers=4).
     # Each variant changes exactly ONE axis so that differences isolate a single factor.
@@ -1545,8 +1548,8 @@ def experiment_6_baselines(config: ExperimentConfig, dataset: Dict) -> Dict:
             torch.from_numpy(val_in).float(),
             torch.from_numpy(val_tgt).float()
         )
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=config.fno_batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=config.fno_batch_size, shuffle=False)
         return train_loader, val_loader
 
     # Windowed loaders for LSTM and U-Net (shape: batch, k_history, n_bins)
@@ -1978,8 +1981,8 @@ def experiment_8_grid_convergence(
         val_ds.target_mean = train_ds.target_mean
         val_ds.target_std  = train_ds.target_std
 
-        train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=0)
-        val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False, num_workers=0)
+        train_loader = DataLoader(train_ds, batch_size=config.fno_batch_size, shuffle=True, num_workers=0)
+        val_loader   = DataLoader(val_ds,   batch_size=config.fno_batch_size, shuffle=False, num_workers=0)
 
         # Keep n_modes <= n_bins // 2 (Nyquist limit)
         n_modes = min(config.fno_modes, n_bins // 2)
@@ -2130,8 +2133,8 @@ def experiment_9_multi_seed(
     val_ds.target_mean = train_ds.target_mean
     val_ds.target_std  = train_ds.target_std
 
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=0)
-    val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=config.fno_batch_size, shuffle=True, num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=config.fno_batch_size, shuffle=False, num_workers=0)
 
     best_val_losses = []
     rollout_mses_all = []
@@ -2535,6 +2538,7 @@ def run_all_experiments(
     config: Optional[ExperimentConfig] = None,
     smoke_test: bool = False,
     load_dataset: Optional[str] = None,
+    load_lyapunov: Optional[str] = None,
     load_fno: Optional[str] = None,
     start_from: int = 1,
 ) -> Tuple[Dict, str]:
@@ -2575,11 +2579,16 @@ def run_all_experiments(
     # ── Validate resume arguments ──────────────────────────────────────────
     if load_dataset and not os.path.isfile(load_dataset):
         raise FileNotFoundError(f"--load-dataset: file not found: {load_dataset}")
+    if load_lyapunov and not os.path.isfile(load_lyapunov):
+        raise FileNotFoundError(f"--load-lyapunov: file not found: {load_lyapunov}")
     if load_fno and not os.path.isfile(load_fno):
         raise FileNotFoundError(f"--load-fno: file not found: {load_fno}")
     if load_dataset and start_from < 2:
         # Dataset is being loaded, so Exp 1 is implicitly skipped.
         start_from = max(start_from, 2)
+    if load_lyapunov and start_from < 3:
+        # Lyapunov results loaded, so Exp 2 is implicitly skipped.
+        start_from = max(start_from, 3)
     if load_fno and start_from < 4:
         # FNO checkpoint supplied — Exps 3 & 3b are implicitly skipped.
         start_from = max(start_from, 4)
@@ -2661,8 +2670,22 @@ def run_all_experiments(
         lyapunov_results = experiment_2_lyapunov_characterization(config)
         all_results["experiment_2_lyapunov"] = lyapunov_results
         timer.stop("Exp 2: Lyapunov Characterisation", t0)
+
+        lyapunov_path = os.path.join(run_dir, "lyapunov_results.json")
+        with open(lyapunov_path, "w") as f:
+            json.dump(lyapunov_results, f, indent=2, default=_json_safe)
+        print(f"  Lyapunov results saved to {lyapunov_path}")
     else:
-        print("  [SKIP Exp 2] Lyapunov characterisation")
+        _lyap_path = load_lyapunov
+        if _lyap_path is None:
+            print("  [SKIP Exp 2] Lyapunov characterisation (results not loaded)")
+            all_results["experiment_2_lyapunov"] = {}
+        else:
+            print(f"  [SKIP Exp 2] Loading Lyapunov results from {_lyap_path} ...")
+            with open(_lyap_path) as _f:
+                lyapunov_results = json.load(_f)
+            all_results["experiment_2_lyapunov"] = lyapunov_results
+            print("  Lyapunov results loaded.")
 
     # ------------------------------------------------------------------
     # Experiment 3: FNO training
@@ -2964,6 +2987,9 @@ Resume examples:
                         help="Override experiment name (default: paper1_<mode>)")
     parser.add_argument("--smoke-test-7b", action="store_true",
                         help="Run Experiment 7b in smoke-test mode (saves time)")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Mini-batch size for all FNO DataLoaders (default: 32). "
+                             "Reduce to 16 or 8 if hitting GPU OOM.")
     parser.add_argument(
         "--load-dataset",
         default=None,
@@ -2971,6 +2997,14 @@ Resume examples:
         help="Path to an existing dataset.json from a previous run. "
              "Skips Experiment 1 (dataset generation). "
              "Required when --start-from >= 2.",
+    )
+    parser.add_argument(
+        "--load-lyapunov",
+        default=None,
+        metavar="PATH",
+        help="Path to an existing lyapunov_results.json from a previous run. "
+             "Skips Experiment 2 (Lyapunov characterisation). "
+             "Requires --load-dataset to also be set.",
     )
     parser.add_argument(
         "--load-fno",
@@ -3002,8 +3036,11 @@ Resume examples:
         print(f"  Resuming from experiment {args.start_from}")
     if args.load_dataset:
         print(f"  load_dataset={args.load_dataset}")
+    if args.load_lyapunov:
+        print(f"  load_lyapunov={args.load_lyapunov}")
     if args.load_fno:
         print(f"  load_fno={args.load_fno}")
+    print(f"  batch_size={args.batch_size}")
 
     config = ExperimentConfig(
         experiment_name=exp_name,
@@ -3013,13 +3050,15 @@ Resume examples:
         n_validation_trajectories=n_val,
         n_test_trajectories=n_test,
         simulation_time=sim_time,
-        # All FNO / LSTM architecture params stay at their ExperimentConfig defaults
+        fno_batch_size=args.batch_size,
+        # All other FNO / LSTM architecture params stay at their ExperimentConfig defaults
     )
 
     results, output_dir = run_all_experiments(
         config,
         smoke_test=args.smoke_test_7b,
         load_dataset=args.load_dataset,
+        load_lyapunov=args.load_lyapunov,
         load_fno=args.load_fno,
         start_from=args.start_from,
     )
